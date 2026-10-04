@@ -29,6 +29,14 @@ lto = true
 codegen-units = 1
 strip = true
 
+# Release-speed code without the long single-threaded LTO link, for local
+# perf runs: `cargo build --profile fast -p sorrel --features bench`.
+[profile.fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = false
+
 # GPUI is unusably slow unoptimized; keep our own crates fast to rebuild.
 [profile.dev.package."*"]
 opt-level = 2

@@ -18,6 +18,7 @@ use ui::Workspace;
 const IDLE: Duration = Duration::from_secs(15);
 const SCROLL_ROWS_PER_STEP: usize = 20;
 const SCROLL_STEP: Duration = Duration::from_millis(8);
+const SETTLE: Duration = Duration::from_secs(3);
 
 pub fn run(
     view: Entity<Workspace>,
@@ -61,6 +62,11 @@ pub fn run(
             cx.background_executor().timer(SCROLL_STEP).await;
         }
         let scroll = Phase::new(collector.collect_unseen());
+
+        // Let the last transitions (streamed-text fade, scrollbar, jump
+        // button) finish; idle starts once nothing is moving.
+        cx.background_executor().timer(SETTLE).await;
+        collector.collect_unseen();
 
         // Idle: nothing changes, so nothing should draw.
         write(&out, r#"{"phase":"idle"}"#);

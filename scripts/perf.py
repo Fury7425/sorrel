@@ -79,6 +79,8 @@ def main():
     time.sleep(10)
     cpu_after, t_after = app.cpu_times(), time.monotonic()
     idle_rss = app.memory_info().rss
+    # Private memory leaves out shared and mapped pages (fonts, GPU driver).
+    idle_private = app.memory_full_info().uss
     report = wait_for("done")
     proc.wait(timeout=30)
 
@@ -90,6 +92,7 @@ def main():
         "idle_cpu_pct": 100 * busy / (t_after - t_before),
         "stream_draw_p99_ms": report["stream"]["draw_ms"]["p99"],
         "scroll_draw_p99_ms": report["scroll"]["draw_ms"]["p99"],
+        "idle_private_mb": idle_private / 1e6,
         "peak_rss_mb": peak_rss / 1e6,
         "idle_frames": report["idle"]["frames"],
     }

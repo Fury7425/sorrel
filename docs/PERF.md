@@ -6,4 +6,6 @@ Measure with `python scripts/perf.py target/release/sorrel --seed 10000 --pace-m
 
 | Date | Commit | OS / GPU | First frame (ms) | Idle RSS (MB) | Peak RSS (MB) | Idle CPU (%) | Stream draw p99 (ms) | Scroll draw p99 (ms) | Idle frames / 15 s | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 2026-10-04 | Phases 0 to 3 written | Windows 11 | not measured | not measured | not measured | not measured | not measured | not measured | not measured | Not built locally (no Windows SDK); first numbers will come from CI or a local build. |
+| 2026-10-04 | 317bf43+ | macOS 15, GitHub runner (Metal) | 2308 | 116.5 | 116.6 | 0.8 | 9.0 | 18.0 | 2 | Release build, 10k rows. First frame is a cold CI runner; scroll is the worst case (20-row jumps every 8 ms). |
+| 2026-10-04 | 317bf43+ | Windows 11, local laptop GPU | 257–297 warm, 640–802 cold | 206.4 (private 160.2) | 214.9 | 0.0 | 4.2 | 3.6 | 0 | `fast` profile, 10k rows, 3 s settle before idle. Empty window: 171 RSS / 127 private. gpui-component's own hello_world on the same machine: 221 RSS / 155 private, so the Windows floor is the framework's. |
+| 2026-10-04 | 317bf43 | Ubuntu 24.04, GitHub runner (llvmpipe, Xvfb) | 3394 | 243.8 | 243.8 | 30.0 | 649.9 | 4.4 | 42 | Software rendering, before the idle and bench fixes; regression tripwire only. |
