@@ -63,9 +63,30 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
-    // Native installers put CLIs here without always fixing PATH for GUI apps.
+    // Installers put CLIs here without always fixing PATH for GUI apps.
     if let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }) {
-        dirs.push(PathBuf::from(&home).join(".local/bin"));
+        let home = PathBuf::from(home);
+        for sub in [
+            ".local/bin",
+            ".claude/local",
+            ".opencode/bin",
+            ".bun/bin",
+            ".volta/bin",
+            ".cargo/bin",
+            ".npm-global/bin",
+            "scoop/shims",
+        ] {
+            dirs.push(home.join(sub));
+        }
+    }
+    if cfg!(windows) {
+        for (var, sub) in [("APPDATA", "npm"), ("LOCALAPPDATA", "cursor-agent")] {
+            if let Some(base) = std::env::var_os(var) {
+                dirs.push(PathBuf::from(base).join(sub));
+            }
+        }
+    } else {
+        dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
     }
     dirs.iter().find_map(|dir| {
         exts.iter().find_map(|ext| {

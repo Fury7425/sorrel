@@ -610,6 +610,15 @@ pub struct AuthStatus {
     pub provider: Provider,
     pub state: AuthState,
     pub detail: String,
+    /// Where the CLI was found; empty when it was not.
+    #[serde(default)]
+    pub bin: String,
+    /// First line of `--version`.
+    #[serde(default)]
+    pub version: String,
+    /// The signed-in account's email, when the CLI reports it.
+    #[serde(default)]
+    pub account: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

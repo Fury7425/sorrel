@@ -201,6 +201,9 @@ impl Engine {
                             provider,
                             state: AuthState::Unknown,
                             detail: "Checking…".into(),
+                            bin: String::new(),
+                            version: String::new(),
+                            account: String::new(),
                         })
                         .collect(),
                     settings: self.settings.view(&self.dirs.data),
@@ -1125,6 +1128,11 @@ impl Engine {
     }
 
     fn check_auth(&self) {
+        tokio::spawn(self.auth_job());
+    }
+
+    /// Detects every CLI and asks each about its sign-in, then reports.
+    fn auth_job(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
         let updates = self.updates.clone();
         let keyed: Vec<Provider> = Provider::ALL
             .into_iter()
@@ -1134,28 +1142,60 @@ impl Engine {
             .into_iter()
             .map(|p| (p, self.settings.bin(p), self.settings.config(p).disabled))
             .collect();
-        tokio::spawn(async move {
+        async move {
+            let checks: Vec<_> = setup
+                .into_iter()
+                .map(|(provider, bin, disabled)| {
+                    let keyed = keyed.contains(&provider);
+                    tokio::spawn(async move {
+                        let version = if disabled { None } else { detect(&bin).await };
+                        let mut account = String::new();
+                        let (state, detail) = if disabled {
+                            (AuthState::Unknown, "Turned off".to_owned())
+                        } else if version.is_none() {
+                            (
+                                AuthState::Missing,
+                                "Not found on PATH or in the usual install folders.".to_owned(),
+                            )
+                        } else if keyed {
+                            (AuthState::ApiKey, "Using your API key".to_owned())
+                        } else {
+                            match provider {
+                                Provider::Claude => {
+                                    let (state, detail, email) = claude::auth_status(&bin).await;
+                                    account = email;
+                                    (state, detail)
+                                }
+                                Provider::Codex => codex::login_status(&bin).await,
+                                other => (
+                                    AuthState::Unknown,
+                                    format!("Installed. {}", acp::launch(other).sign_in),
+                                ),
+                            }
+                        };
+                        AuthStatus {
+                            provider,
+                            state,
+                            detail,
+                            bin: if version.is_some() {
+                                bin.display().to_string()
+                            } else {
+                                String::new()
+                            },
+                            version: version.unwrap_or_default(),
+                            account,
+                        }
+                    })
+                })
+                .collect();
             let mut statuses = Vec::new();
-            for (provider, bin, disabled) in setup {
-                let (state, detail) = if disabled {
-                    (AuthState::Unknown, "Turned off".to_owned())
-                } else if keyed.contains(&provider) {
-                    (AuthState::ApiKey, "Using your API key".to_owned())
-                } else {
-                    match provider {
-                        Provider::Claude => claude::auth_status(&bin).await,
-                        Provider::Codex => codex::login_status(&bin).await,
-                        other => probe(&bin, acp::launch(other).sign_in).await,
-                    }
-                };
-                statuses.push(AuthStatus {
-                    provider,
-                    state,
-                    detail,
-                });
+            for check in checks {
+                if let Ok(status) = check.await {
+                    statuses.push(status);
+                }
             }
             let _ = updates.send(Update::Auth(statuses));
-        });
+        }
     }
 
     fn sign_in(&mut self, provider: Provider) {
@@ -1171,11 +1211,31 @@ impl Engine {
                     let _ = updates.send(update);
                 });
             }
-            Provider::Claude => self.notice(
-                "Run `claude auth login` in a terminal, then press Check again. Sorrel never handles your Claude login.",
-                false,
-            ),
-            other => self.notice(acp::launch(other).sign_in, false),
+            other => {
+                let args: &[&str] = match other {
+                    Provider::Claude | Provider::OpenCode => &["auth", "login"],
+                    Provider::Cursor => &["login"],
+                    _ => &[], // gemini asks on first run
+                };
+                let bin = self.settings.bin(other);
+                match open_login(&bin, args) {
+                    Ok(mut child) => {
+                        let recheck = self.auth_job();
+                        tokio::spawn(async move {
+                            let _ = child.wait().await;
+                            recheck.await;
+                        });
+                    }
+                    Err(e) => self.notice(
+                        format!(
+                            "Could not open a terminal ({e}). Run `{} {}` yourself, then press refresh.",
+                            bin.display(),
+                            args.join(" ")
+                        ),
+                        true,
+                    ),
+                }
+            }
         }
     }
 
@@ -1230,22 +1290,62 @@ impl Engine {
     }
 }
 
-/// Whether an ACP agent's CLI is installed. Sign-in is checked when a session
-/// starts, since ACP has no status call that does not start one.
-async fn probe(bin: &Path, sign_in: &str) -> (AuthState, String) {
+/// Runs a CLI's login command in a terminal window the user can see, so the
+/// CLI does the sign-in and keeps the credentials; Sorrel never touches them.
+fn open_login(bin: &Path, args: &[&str]) -> std::io::Result<tokio::process::Child> {
+    #[cfg(windows)]
+    {
+        let mut cmd = tokio::process::Command::new(bin);
+        cmd.args(args).creation_flags(0x0000_0010); // CREATE_NEW_CONSOLE
+        cmd.spawn()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // ponytail: Terminal.app only, and Sorrel can't tell when the login ends; refresh rechecks.
+        let line = std::iter::once(bin.display().to_string())
+            .chain(args.iter().map(|a| (*a).to_owned()))
+            .map(|part| format!("'{}'", part.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let script = format!(
+            "tell application \"Terminal\" to do script \"{}\"",
+            line.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        tokio::process::Command::new("osascript")
+            .args(["-e", &script, "-e", "tell application \"Terminal\" to activate"])
+            .spawn()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let mut cmd = tokio::process::Command::new("x-terminal-emulator");
+        cmd.arg("-e").arg(bin).args(args);
+        cmd.spawn()
+    }
+}
+
+/// The first line of `bin --version`, or `None` when the CLI is not there.
+/// ACP agents' sign-in is checked when a session starts, since ACP has no
+/// status call that does not start one.
+async fn detect(bin: &Path) -> Option<String> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.arg("--version")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    match tokio::time::timeout(Duration::from_secs(15), cmd.status()).await {
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => (
-            AuthState::Missing,
-            format!("{} was not found.", bin.display()),
+    match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(Ok(out)) => Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
         ),
-        _ => (AuthState::Unknown, format!("Installed. {sign_in}")),
+        // Slow or odd, but it exists.
+        _ => Some(String::new()),
     }
 }

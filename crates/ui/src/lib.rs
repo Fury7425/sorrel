@@ -23,7 +23,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use proto::{
-    AuthStatus, ModelInfo, OpenIn, Preferences, ProjectId, ProjectInfo, Provider, Request,
+    AuthState, AuthStatus, ModelInfo, OpenIn, Preferences, ProjectId, ProjectInfo, Provider, Request,
     SettingsView, TaskInfo, ThreadId, ThreadInfo, TurnSettings, Update, UsageReport,
 };
 use tokio::sync::mpsc;
@@ -133,7 +133,8 @@ pub struct Workspace {
     palette: Option<Palette>,
     dir: (String, Vec<String>),
     /// The provider open on the Providers page.
-    provider_page: Provider,
+    /// The open card on the Providers page.
+    provider_open: Option<Provider>,
     task_project: Option<ProjectId>,
     task_provider: Provider,
     usage: Option<UsageReport>,
@@ -318,7 +319,7 @@ impl Workspace {
             env_adding: false,
             palette: None,
             dir: (String::new(), Vec::new()),
-            provider_page: Provider::Claude,
+            provider_open: Some(Provider::Claude),
             task_project: None,
             task_provider: Provider::Claude,
             usage: None,
@@ -423,7 +424,10 @@ impl Workspace {
                 self.sync_views(cx);
             }
             Update::Tasks(tasks) => self.tasks = tasks,
-            Update::Auth(auth) => self.auth = auth,
+            Update::Auth(auth) => {
+                self.auth = auth;
+                self.sync_views(cx);
+            }
             Update::Settings(settings) => {
                 self.load_provider_editors(&settings, window, cx);
                 self.settings = settings;
@@ -595,7 +599,13 @@ impl Workspace {
                 .settings
                 .providers
                 .iter()
-                .filter(|(_, c)| !c.disabled)
+                .filter(|(p, c)| {
+                    !c.disabled
+                        && !self
+                            .auth
+                            .iter()
+                            .any(|a| a.provider == *p && a.state == AuthState::Missing)
+                })
                 .map(|(p, _)| *p)
                 .collect(),
         }

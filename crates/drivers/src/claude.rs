@@ -68,30 +68,45 @@ pub fn models() -> Vec<ModelInfo> {
     .collect()
 }
 
-/// Asks `claude auth status`. Never reads credential files.
-pub async fn auth_status(bin: &Path) -> (AuthState, String) {
+/// Asks `claude auth status`: state, detail (the plan when signed in), and
+/// the account's email. Never reads credential files.
+pub async fn auth_status(bin: &Path) -> (AuthState, String, String) {
     let mut cmd = crate::command(bin);
     cmd.args(["auth", "status"]).stdin(Stdio::null());
     let output = match tokio::time::timeout(Duration::from_secs(30), cmd.output()).await {
-        Err(_) => return (AuthState::Unknown, "`claude auth status` timed out".into()),
-        Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => {
-            return (AuthState::Missing, crate::spawn_error(bin, &e));
+        Err(_) => {
+            return (
+                AuthState::Unknown,
+                "`claude auth status` timed out".into(),
+                String::new(),
+            );
         }
-        Ok(Err(e)) => return (AuthState::Unknown, e.to_string()),
+        Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => {
+            return (AuthState::Missing, crate::spawn_error(bin, &e), String::new());
+        }
+        Ok(Err(e)) => return (AuthState::Unknown, e.to_string(), String::new()),
         Ok(Ok(output)) => output,
     };
     let status: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
     let method = status["authMethod"].as_str().unwrap_or_default().to_owned();
+    let email = status["email"].as_str().unwrap_or_default().to_owned();
+    let plan = match status["subscriptionType"].as_str() {
+        Some(plan) if !plan.is_empty() => {
+            let mut chars = plan.chars();
+            chars.next().map_or(String::new(), |c| c.to_uppercase().chain(chars).collect())
+        }
+        _ => method.clone(),
+    };
     match status["loggedIn"].as_bool() {
-        Some(true) if method.to_ascii_lowercase().contains("key") => (AuthState::ApiKey, method),
-        Some(true) => (AuthState::Subscription, method),
-        Some(false) => (
-            AuthState::SignedOut,
-            "Run `claude auth login` in a terminal.".into(),
-        ),
+        Some(true) if method.to_ascii_lowercase().contains("key") => {
+            (AuthState::ApiKey, method, email)
+        }
+        Some(true) => (AuthState::Subscription, plan, email),
+        Some(false) => (AuthState::SignedOut, "Not signed in".into(), String::new()),
         None => (
             AuthState::Unknown,
             String::from_utf8_lossy(&output.stderr).into_owned(),
+            String::new(),
         ),
     }
 }
@@ -103,8 +118,8 @@ async fn preflight(cfg: &SessionConfig) -> Result<(), String> {
         return Ok(());
     }
     match auth_status(&cfg.bin).await {
-        (AuthState::Missing, detail) => Err(detail),
-        (AuthState::SignedOut, _) => Err(
+        (AuthState::Missing, detail, _) => Err(detail),
+        (AuthState::SignedOut, ..) => Err(
             "Claude Code is not signed in. Run `claude auth login` in a terminal, or add an Anthropic API key in Settings."
                 .into(),
         ),
@@ -160,9 +175,9 @@ pub async fn run(
                         }
                         let running = process.as_mut().expect("spawned above");
                         let mut written = Ok(());
-                        if permission_mode(&wanted) != permission_mode(&current) {
+                        if permission_mode(&wanted, restricted(&cfg)) != permission_mode(&current, restricted(&cfg)) {
                             next_request += 1;
-                            let request = json!({ "subtype": "set_permission_mode", "mode": permission_mode(&wanted) });
+                            let request = json!({ "subtype": "set_permission_mode", "mode": permission_mode(&wanted, restricted(&cfg)) });
                             written = running.write(&control_request(next_request, request)).await;
                         }
                         if written.is_ok() && wanted.model != current.model {
@@ -742,12 +757,24 @@ the current folder with the Write tool and say its file name; the app shows it a
 /// Tools a Chat conversation may use: look things up and make files in its own folder.
 const CHAT_TOOLS: &str = "WebSearch,WebFetch,Read,Write";
 
-fn permission_mode(settings: &TurnSettings) -> &'static str {
+/// Restricted sessions (Chat, or `CLAUDE_CODE_RESTRICTED` in the environment)
+/// refuse `bypassPermissions` and `--allow-dangerously-skip-permissions`.
+fn restricted(cfg: &SessionConfig) -> bool {
+    cfg.chat
+        || cfg.args.iter().any(|a| a == "--restricted")
+        || std::env::var("CLAUDE_CODE_RESTRICTED").is_ok_and(|v| {
+            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        })
+}
+
+fn permission_mode(settings: &TurnSettings, restricted: bool) -> &'static str {
     match (settings.mode, settings.access) {
         (Mode::Plan, _) => "plan",
         (_, Access::Supervised) => "default",
         (_, Access::AutoEdits) => "acceptEdits",
         (_, Access::Auto) => "auto",
+        // ponytail: closest mode a restricted session allows.
+        (_, Access::FullAccess) if restricted => "acceptEdits",
         (_, Access::FullAccess) => "bypassPermissions",
     }
 }
@@ -818,17 +845,16 @@ impl Process {
             "--include-partial-messages",
             "--verbose",
             "--permission-mode",
-            permission_mode(settings),
+            permission_mode(settings, restricted(cfg)),
         ]);
         if cfg.unattended {
             cmd.args(["--permission-prompts", "none"]);
         } else {
-            // Lets the user switch to Full access later without a restart.
-            cmd.args([
-                "--permission-prompt-tool",
-                "stdio",
-                "--allow-dangerously-skip-permissions",
-            ]);
+            cmd.args(["--permission-prompt-tool", "stdio"]);
+            if !restricted(cfg) {
+                // Lets the user switch to Full access later without a restart.
+                cmd.arg("--allow-dangerously-skip-permissions");
+            }
         }
         let launch = Launch::of(settings);
         if let Some(model) = model_name(settings) {
@@ -891,6 +917,18 @@ async fn next_line(process: &mut Option<Process>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_never_asks_for_bypass() {
+        let mut cfg = SessionConfig::new("claude".into(), ".".into(), ".".into());
+        let full = TurnSettings {
+            access: Access::FullAccess,
+            ..TurnSettings::default()
+        };
+        assert_eq!(permission_mode(&full, restricted(&cfg)), "bypassPermissions");
+        cfg.chat = true;
+        assert_eq!(permission_mode(&full, restricted(&cfg)), "acceptEdits");
+    }
 
     #[test]
     fn answers_are_keyed_by_question_text() {

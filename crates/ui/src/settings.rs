@@ -852,53 +852,53 @@ impl Workspace {
 
     fn render_providers(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let (fg, muted, danger, success, mono) = (
+        let (fg, muted, danger, primary, mono) = (
             theme.foreground,
             theme.muted_foreground,
             theme.danger,
-            theme.success,
+            theme.primary,
             theme.mono_font_family.clone(),
         );
-        let selected = self.provider_page;
-        let status_of = |p: Provider| {
-            self.auth
-                .iter()
-                .find(|a| a.provider == p)
-                .map(|a| (a.state, a.detail.clone()))
-                .unwrap_or((AuthState::Unknown, String::new()))
-        };
-        let state_text = |state: AuthState| match state {
-            AuthState::Unknown => "Checking",
-            AuthState::Missing => "Not installed",
-            AuthState::SignedOut => "Signed out",
-            AuthState::Subscription => "Signed in · subscription",
-            AuthState::ApiKey => "Using an API key",
-        };
-        let state_color = |state: AuthState| match state {
-            AuthState::Subscription | AuthState::ApiKey => success,
-            AuthState::Missing | AuthState::SignedOut => danger,
-            AuthState::Unknown => muted,
-        };
+        let open = self.provider_open;
 
-        let list = v_flex()
-            .w(px(270.))
-            .flex_shrink_0()
-            .border_r_1()
-            .border_color(fg.opacity(0.06))
-            .children(Provider::ALL.iter().map(|&p| {
+        let cards: Vec<AnyElement> = Provider::ALL
+            .iter()
+            .map(|&p| {
                 let config = self.provider_config(p);
-                let (state, _) = status_of(p);
-                h_flex()
+                let status = self.auth.iter().find(|a| a.provider == p).cloned();
+                let state = status.as_ref().map_or(AuthState::Unknown, |s| s.state);
+                let version = status
+                    .as_ref()
+                    .and_then(|s| {
+                        s.version
+                            .split_whitespace()
+                            .map(|w| w.trim_start_matches('v'))
+                            .find(|w| w.starts_with(|c: char| c.is_ascii_digit()))
+                            .map(|w| format!("v{w}"))
+                    })
+                    .unwrap_or_default();
+                let state_text = match state {
+                    AuthState::Unknown if status.is_none() => "Checking",
+                    AuthState::Unknown => "Installed",
+                    AuthState::Missing => "Not installed",
+                    AuthState::SignedOut => "Signed out",
+                    AuthState::Subscription => "Signed in",
+                    AuthState::ApiKey => "Using an API key",
+                };
+                let subtitle = match (config.disabled, version.is_empty()) {
+                    (true, _) => "Off".to_owned(),
+                    (false, true) => state_text.to_owned(),
+                    (false, false) => format!("{version} · {state_text}"),
+                };
+                let is_open = open == Some(p);
+
+                let header = h_flex()
                     .id(("provider", p as usize))
-                    .items_start()
-                    .gap_2p5()
-                    .px_3p5()
+                    .gap_4()
+                    .px_4()
                     .py_3p5()
-                    .border_b_1()
-                    .border_color(fg.opacity(0.05))
                     .cursor_pointer()
-                    .when(p == selected, |el| el.bg(fg.opacity(0.05)))
-                    .child(provider_tile(p, 22.).mt_0p5())
+                    .child(provider_tile(p, 44.))
                     .child(
                         v_flex()
                             .flex_1()
@@ -906,29 +906,29 @@ impl Workspace {
                             .gap_0p5()
                             .child(
                                 div()
-                                    .text_sm()
+                                    .text_base()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .when(config.disabled, |el| el.text_color(muted))
                                     .child(p.label()),
                             )
                             .child(
-                                h_flex()
-                                    .gap_1p5()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(div().size(px(6.)).rounded_full().bg(
-                                        if config.disabled {
-                                            muted.opacity(0.5)
-                                        } else {
-                                            state_color(state)
-                                        },
-                                    ))
-                                    .child(if config.disabled {
-                                        "Off"
-                                    } else {
-                                        state_text(state)
-                                    }),
+                                div()
+                                    .text_sm()
+                                    .truncate()
+                                    .text_color(match state {
+                                        AuthState::Missing if !config.disabled => danger,
+                                        _ => muted,
+                                    })
+                                    .child(subtitle),
                             ),
+                    )
+                    .child(
+                        Icon::new(if is_open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .text_color(muted),
                     )
                     .child(
                         Switch::new(("provider-on", p as usize))
@@ -943,17 +943,61 @@ impl Workspace {
                             })),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.provider_page = p;
-                        this.env_adding = false;
-                        if !this.catalog.contains_key(&p) {
-                            this.request(Request::ListModels { provider: p });
+                        if this.provider_open == Some(p) {
+                            this.provider_open = None;
+                        } else {
+                            this.provider_open = Some(p);
+                            this.env_adding = false;
+                            if !this.catalog.contains_key(&p) {
+                                this.request(Request::ListModels { provider: p });
+                            }
                         }
                         cx.notify();
-                    }))
-            }));
+                    }));
 
-        let config = self.provider_config(selected);
-        let (state, detail) = status_of(selected);
+                card(cx)
+                    .overflow_hidden()
+                    .child(header)
+                    .when(is_open, |el| {
+                        el.child(self.render_provider_body(
+                            p,
+                            &config,
+                            status.as_ref(),
+                            (fg, muted, primary, mono.clone()),
+                            cx,
+                        ))
+                    })
+                    .into_any_element()
+            })
+            .collect();
+
+        let check = Button::new("providers-check")
+            .ghost()
+            .small()
+            .icon(IconName::RefreshCw)
+            .label("Detect again")
+            .on_click(cx.listener(|this, _, _, _| this.request(Request::CheckAuth)));
+        page(
+            "providers",
+            "Providers",
+            Some(check.into_any_element()),
+            [v_flex().gap_3().children(cards).into_any_element()],
+        )
+    }
+
+    /// An open provider card: account, runtime, environment and models.
+    fn render_provider_body(
+        &self,
+        selected: Provider,
+        config: &ProviderConfig,
+        status: Option<&proto::AuthStatus>,
+        (fg, muted, primary, mono): (Hsla, Hsla, Hsla, SharedString),
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let state = status.map_or(AuthState::Unknown, |s| s.state);
+        let detail = status.map(|s| s.detail.clone()).unwrap_or_default();
+        let account = status.map(|s| s.account.clone()).unwrap_or_default();
+        let found = status.map(|s| (s.bin.clone(), s.version.clone())).unwrap_or_default();
         let key_set = self.settings.api_key_set.contains(&selected);
         let using_key = self.settings.use_api_key.contains(&selected);
         let editor = |list: &Vec<(Provider, Entity<InputState>)>| {
@@ -969,121 +1013,188 @@ impl Workspace {
         let models = self.catalog.get(&selected).cloned().unwrap_or_default();
         let signed_in = matches!(state, AuthState::Subscription | AuthState::ApiKey);
 
-        let account = card(cx)
+        let section = |title: &'static str| {
+            h_flex()
+                .pt_5()
+                .pb_1()
+                .text_base()
+                .text_color(muted)
+                .child(div().flex_1().child(title))
+        };
+
+        // Who the CLI is signed in as, like a one-account list.
+        let name = if !account.is_empty() {
+            account.clone()
+        } else {
+            match state {
+                AuthState::Subscription => format!("{} account", short_label(selected)),
+                AuthState::ApiKey => "API key".to_owned(),
+                AuthState::Missing => "Not installed".to_owned(),
+                AuthState::SignedOut => "Not signed in".to_owned(),
+                AuthState::Unknown => short_label(selected).to_owned(),
+            }
+        };
+        let initial = name
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_default();
+        let account_row = h_flex()
+            .gap_3()
+            .py_3()
+            .border_b_1()
+            .border_color(fg.opacity(0.06))
             .child(
-                h_flex()
-                    .gap_4()
-                    .px_4()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(fg.opacity(0.05))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_0p5()
-                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Account"))
-                            .child(
-                                h_flex()
-                                    .gap_1p5()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(div().size(px(6.)).rounded_full().bg(state_color(state)))
-                                    .child(div().truncate().child(if detail.is_empty() {
-                                        state_text(state).to_owned()
-                                    } else {
-                                        format!("{} · {detail}", state_text(state))
-                                    })),
-                            ),
-                    )
-                    .child(
-                        Button::new("check-auth")
-                            .ghost()
-                            .small()
-                            .icon(IconName::RefreshCw)
-                            .tooltip("Check again")
-                            .on_click(cx.listener(|this, _, _, _| this.request(Request::CheckAuth))),
-                    )
-                    .child(
-                        Button::new("sign-in")
-                            .outline()
-                            .small()
-                            .label(if signed_in { "Sign in again" } else { "Sign in" })
-                            .on_click(cx.listener(move |this, _, _, _| {
-                                this.request(Request::SignIn { provider: selected })
-                            })),
-                    ),
+                div()
+                    .size(px(40.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .border_2()
+                    .border_color(if signed_in { primary } else { fg.opacity(0.15) })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(initial),
             )
-            .child(row(
-                "Use an API key instead",
-                if key_set {
-                    "A key is saved on this machine. Turn it on to use it instead of the CLI's own sign-in."
-                } else {
-                    "Saved on this machine and handed to the CLI. Press Enter to save."
-                },
-                h_flex()
-                    .gap_2()
-                    .children(key.map(|key| div().w(px(200.)).child(Input::new(&key).small())))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(div().text_base().font_weight(FontWeight::SEMIBOLD).truncate().child(name))
                     .child(
-                        Switch::new("use-key")
-                            .checked(using_key)
-                            .disabled(!key_set)
-                            .on_click(cx.listener(move |this, on: &bool, _, _| {
-                                this.request(Request::SetUseApiKey {
+                        h_flex()
+                            .gap_1p5()
+                            .text_sm()
+                            .text_color(muted)
+                            .when(!detail.is_empty() && state != AuthState::Missing, |el| {
+                                el.child(div().truncate().child(detail.clone()))
+                            })
+                            .when(signed_in, |el| {
+                                el.child("·").child(div().text_color(primary).child("In use"))
+                            }),
+                    ),
+            );
+
+        let install = install_command(selected);
+        let sign_in_row = if state == AuthState::Missing {
+            h_flex()
+                .gap_3()
+                .py_2p5()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .font_family(mono.clone())
+                        .text_color(muted)
+                        .child(install),
+                )
+                .child(
+                    Button::new("copy-install")
+                        .outline()
+                        .small()
+                        .label("Copy install command")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(install.to_owned()));
+                        })),
+                )
+        } else {
+            h_flex().py_1().child(
+                Button::new("sign-in")
+                    .ghost()
+                    .icon(IconName::Plus)
+                    .label(if signed_in { "Sign in with another account" } else { "Sign in" })
+                    .on_click(cx.listener(move |this, _, _, _| {
+                        this.request(Request::SignIn { provider: selected })
+                    })),
+            )
+        };
+
+        let api_key = row(
+            "Use an API key instead",
+            if key_set {
+                "A key is saved on this machine. Turn it on to use it instead of the CLI's own sign-in."
+            } else {
+                "Saved on this machine and handed to the CLI. Press Enter to save."
+            },
+            h_flex()
+                .gap_2()
+                .children(key.map(|key| div().w(px(200.)).child(Input::new(&key).small())))
+                .child(
+                    Switch::new("use-key")
+                        .checked(using_key)
+                        .disabled(!key_set)
+                        .on_click(cx.listener(move |this, on: &bool, _, _| {
+                            this.request(Request::SetUseApiKey {
+                                provider: selected,
+                                on: *on,
+                            })
+                        })),
+                )
+                .when(key_set, |el| {
+                    el.child(
+                        Button::new("remove-key")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Forget the key")
+                            .on_click(cx.listener(move |this, _, _, _| {
+                                this.request(Request::SetApiKey {
                                     provider: selected,
-                                    on: *on,
+                                    key: None,
                                 })
                             })),
                     )
-                    .when(key_set, |el| {
-                        el.child(
-                            Button::new("remove-key")
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Close)
-                                .tooltip("Forget the key")
-                                .on_click(cx.listener(move |this, _, _, _| {
-                                    this.request(Request::SetApiKey {
-                                        provider: selected,
-                                        key: None,
-                                    })
-                                })),
-                        )
-                    }),
-                true,
-                cx,
-            ));
+                }),
+            true,
+            cx,
+        )
+        .px_0();
 
-        let runtime = card(cx)
-            .child(row(
-                "Binary path",
-                format!(
-                    "Leave empty to find {} on PATH. Saved when you press Enter or leave the field.",
-                    short_label(selected).to_lowercase()
-                ),
-                div().w(px(260.)).children(binary.map(|b| Input::new(&b).small())),
-                false,
-                cx,
-            ))
-            .child(row(
-                "Launch arguments",
-                "Extra arguments added when a session starts.",
-                div().w(px(260.)).children(args.map(|a| Input::new(&a).small())),
-                true,
-                cx,
-            ));
+        let binary_help = match found {
+            (bin, _) if bin.is_empty() => format!(
+                "{} was not detected. Leave empty to search PATH and the usual install folders, or point to it. Saved when you press Enter or leave the field.",
+                short_label(selected)
+            ),
+            (bin, version) if version.is_empty() => format!("Detected at {bin}."),
+            (bin, version) => format!("Detected at {bin} · {version}"),
+        };
+        let runtime = v_flex()
+            .child(
+                row(
+                    "Binary path",
+                    binary_help,
+                    div().w(px(260.)).children(binary.map(|b| Input::new(&b).small())),
+                    false,
+                    cx,
+                )
+                .px_0(),
+            )
+            .child(
+                row(
+                    "Launch arguments",
+                    "Extra arguments added when a session starts.",
+                    div().w(px(260.)).children(args.map(|a| Input::new(&a).small())),
+                    true,
+                    cx,
+                )
+                .px_0(),
+            );
 
         let env_rows = config.env.iter().enumerate().map(|(ix, (k, v))| {
             let key = k.clone();
             h_flex()
                 .gap_3()
-                .px_4()
                 .py_2p5()
                 .border_b_1()
                 .border_color(fg.opacity(0.05))
                 .text_sm()
                 .font_family(mono.clone())
-                .child(div().w(px(240.)).truncate().child(k.clone()))
+                .child(div().w(px(220.)).truncate().child(k.clone()))
                 .child(div().flex_1().truncate().text_color(muted).child(v.clone()))
                 .child(
                     Button::new(("remove-env", ix))
@@ -1105,13 +1216,12 @@ impl Workspace {
         let add_row = self.env_adding.then(|| {
             h_flex()
                 .gap_2()
-                .px_4()
                 .py_2p5()
                 .border_b_1()
                 .border_color(fg.opacity(0.05))
                 .child(
                     div()
-                        .w(px(220.))
+                        .w(px(200.))
                         .child(Input::new(&self.editors.env_key).small()),
                 )
                 .child(
@@ -1148,10 +1258,9 @@ impl Workspace {
                         })),
                 )
         });
-        let environment = card(cx).children(env_rows).children(add_row).child(
+        let environment = v_flex().children(env_rows).children(add_row).child(
             h_flex()
                 .gap_4()
-                .px_4()
                 .py_2p5()
                 .child(
                     div()
@@ -1176,7 +1285,7 @@ impl Workspace {
         let model_chips = h_flex()
             .flex_wrap()
             .gap_2()
-            .p_4()
+            .py_2()
             .children(if models.is_empty() {
                 vec![
                     div()
@@ -1203,47 +1312,30 @@ impl Workspace {
                     .collect()
             });
 
-        let detail = v_flex()
-            .flex_1()
-            .min_w_0()
-            .px_4()
-            .py_4()
-            .gap_2()
+        // Indented to line up with the name beside the tile, as in Zeron.
+        v_flex()
+            .pl(px(16. + 44. + 16.))
+            .pr_4()
+            .pb_4()
             .child(
-                h_flex()
-                    .gap_2()
-                    .pb_1()
-                    .text_base()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(provider_icon(selected, 16.))
-                    .child(selected.label()),
+                section("Accounts").child(
+                    Button::new("check-auth")
+                        .ghost()
+                        .small()
+                        .icon(IconName::RefreshCw)
+                        .tooltip("Check again")
+                        .on_click(cx.listener(|this, _, _, _| this.request(Request::CheckAuth))),
+                ),
             )
-            .child(account)
-            .child(heading("Runtime", cx))
+            .child(account_row)
+            .child(sign_in_row)
+            .child(api_key)
+            .child(section("Runtime"))
             .child(runtime)
-            .child(heading("Environment", cx))
+            .child(section("Environment"))
             .child(environment)
-            .child(heading("Models", cx))
-            .child(card(cx).child(model_chips));
-
-        let check = Button::new("providers-check")
-            .ghost()
-            .small()
-            .icon(IconName::RefreshCw)
-            .label("Check again")
-            .on_click(cx.listener(|this, _, _, _| this.request(Request::CheckAuth)));
-        page(
-            "providers",
-            "Providers",
-            Some(check.into_any_element()),
-            [card(cx)
-                .flex_row()
-                .items_start()
-                .overflow_hidden()
-                .child(list)
-                .child(detail)
-                .into_any_element()],
-        )
+            .child(section("Models"))
+            .child(model_chips)
     }
 
     fn render_connectors(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1773,6 +1865,19 @@ impl Workspace {
                     .into_any_element(),
             ],
         )
+    }
+}
+
+/// What to run to install a provider's CLI.
+fn install_command(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude if cfg!(windows) => "irm https://claude.ai/install.ps1 | iex",
+        Provider::Claude => "curl -fsSL https://claude.ai/install.sh | bash",
+        Provider::Codex => "npm install -g @openai/codex",
+        Provider::Cursor if cfg!(windows) => "irm 'https://cursor.com/install?win32=true' | iex",
+        Provider::Cursor => "curl https://cursor.com/install -fsS | bash",
+        Provider::Gemini => "npm install -g @google/gemini-cli",
+        Provider::OpenCode => "npm install -g opencode-ai",
     }
 }
 

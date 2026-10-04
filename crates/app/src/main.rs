@@ -298,6 +298,9 @@ Prefer small diffs."
                         provider,
                         state: AuthState::Subscription,
                         detail: "replay".into(),
+                        bin: String::new(),
+                        version: String::new(),
+                        account: String::new(),
                     })
                     .collect(),
                 settings: SettingsView {
