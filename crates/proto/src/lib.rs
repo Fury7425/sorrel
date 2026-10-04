@@ -652,6 +652,37 @@ pub enum Theme {
     Dark,
 }
 
+/// Textures the wallpaper can be drawn with, after Zeron's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Effect {
+    None,
+    #[default]
+    Scanlines,
+    Dither,
+    Halftone,
+    Ascii,
+}
+
+impl Effect {
+    pub const ALL: [Effect; 5] = [
+        Effect::None,
+        Effect::Scanlines,
+        Effect::Dither,
+        Effect::Halftone,
+        Effect::Ascii,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Effect::None => "None",
+            Effect::Scanlines => "Scanlines",
+            Effect::Dither => "Dither",
+            Effect::Halftone => "Halftone",
+            Effect::Ascii => "ASCII",
+        }
+    }
+}
+
 /// The General and Appearance pages.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -667,8 +698,8 @@ pub struct Preferences {
     pub wallpaper: String,
     /// See-through, blurred window background where the OS supports it.
     pub glass: bool,
-    /// Display-line texture over the wallpaper.
-    pub scanlines: bool,
+    /// A texture baked into the wallpaper.
+    pub effect: Effect,
     /// `#rrggbb`, or empty for the theme's own.
     pub accent: String,
     pub open_in: OpenIn,
@@ -686,7 +717,7 @@ impl Default for Preferences {
             check_updates: true,
             wallpaper: String::new(),
             glass: true,
-            scanlines: true,
+            effect: Effect::Scanlines,
             accent: String::new(),
             open_in: OpenIn::Code,
             last_chat: false,

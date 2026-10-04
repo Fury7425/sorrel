@@ -4,6 +4,7 @@
 //! [`Request`]s; it never sees a vendor's wire format, spawns a process or
 //! touches the database.
 
+mod effects;
 mod settings;
 mod sidebar;
 mod style;
@@ -12,7 +13,8 @@ mod thread;
 use std::collections::{HashMap, VecDeque};
 
 use gpui_kit::component::{
-    ActiveTheme as _, IconName, Selectable as _, Sizable as _, Theme, ThemeMode, TitleBar,
+    ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _, Theme, ThemeMode,
+    TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, TextareaState},
@@ -116,6 +118,14 @@ pub struct Workspace {
     chat_draft: Entity<ThreadView>,
     project_filter: Option<ProjectId>,
     filter_open: bool,
+    /// The sidebar is shown; the title bar's panel button hides it.
+    sidebar_open: bool,
+    /// Views visited, for back and forward, and where we are in them.
+    history: Vec<View>,
+    cursor: usize,
+    /// The wallpaper with its effect baked in: source, effect, baked file.
+    baked: Option<(String, proto::Effect, std::path::PathBuf)>,
+    baking: bool,
     /// The settings dropdown that is open, by id.
     open_select: Option<&'static str>,
     /// The Providers page shows the new-variable row.
@@ -300,6 +310,11 @@ impl Workspace {
             project_filter: None,
             filter_open: false,
             open_select: None,
+            sidebar_open: true,
+            history: Vec::new(),
+            cursor: 0,
+            baked: None,
+            baking: false,
             env_adding: false,
             palette: None,
             dir: (String::new(), Vec::new()),
@@ -744,6 +759,85 @@ impl Workspace {
         .detach();
     }
 
+    /// Notes the current view as a step in the history, dropping anything
+    /// ahead of it. Called each render, so every way of changing view counts.
+    fn record_history(&mut self) {
+        const MAX_HISTORY: usize = 50;
+        if self.history.get(self.cursor) == Some(&self.view) {
+            return;
+        }
+        self.history.truncate(self.cursor + 1);
+        self.history.push(self.view);
+        if self.history.len() > MAX_HISTORY {
+            self.history.remove(0);
+        }
+        self.cursor = self.history.len() - 1;
+    }
+
+    /// Steps back (`-1`) or forward (`1`) through the history.
+    fn step(&mut self, by: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cursor) = self
+            .cursor
+            .checked_add_signed(by)
+            .filter(|&c| c < self.history.len())
+        else {
+            return;
+        };
+        self.cursor = cursor;
+        match self.history[cursor] {
+            View::Thread(id) if self.threads.iter().any(|t| t.id == id) => {
+                self.open_thread(id, window, cx)
+            }
+            View::Thread(_) => self.view = View::Home,
+            View::Project(id) => self.open_project(id, window, cx),
+            view => self.view = view,
+        }
+        // A view that no longer exists was replaced; keep the cursor on it.
+        self.history[cursor] = self.view;
+        cx.notify();
+    }
+
+    /// The wallpaper file to draw: the baked one when its effect is ready,
+    /// else the original while a bake runs in the background.
+    fn wallpaper_file(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let prefs = self.prefs();
+        if prefs.wallpaper.is_empty() {
+            return None;
+        }
+        let (source, effect) = (prefs.wallpaper.clone(), prefs.effect);
+        // Scanlines are drawn live over the picture; the rest are baked into it.
+        if matches!(effect, proto::Effect::None | proto::Effect::Scanlines) {
+            return Some(source);
+        }
+        if let Some((s, e, file)) = &self.baked
+            && *s == source
+            && *e == effect
+        {
+            return Some(file.to_string_lossy().into_owned());
+        }
+        if !self.baking {
+            self.baking = true;
+            let out = effects::cache_path(&self.settings.data_dir.join("cache"), &source, effect);
+            let input = std::path::PathBuf::from(&source);
+            let task = cx
+                .background_spawn(async move { effects::bake(&input, effect, &out).map(|_| out) });
+            let key = source.clone();
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.baking = false;
+                    match result {
+                        Ok(file) => this.baked = Some((key, effect, file)),
+                        Err(message) => this.notice(message, true),
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        Some(source)
+    }
+
     fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (muted, primary, warning) = (theme.muted_foreground, theme.primary, theme.warning);
@@ -785,6 +879,7 @@ impl Workspace {
                     .map(|i| i.folder.clone());
                 let pane_open = self.thread.as_ref().is_some_and(|t| t.read(cx).pane_open());
                 let actions = h_flex()
+                    .occlude()
                     .gap_1()
                     .when_some(folder, |el, folder| {
                         el.child(
@@ -830,18 +925,57 @@ impl Workspace {
             View::Usage => (crumb(None, "Usage".into()), None, None),
         };
         let _ = window;
+        let (can_back, can_forward) = (self.cursor > 0, self.cursor + 1 < self.history.len());
+        // Buttons in the title bar block the drag strip under them; otherwise
+        // Windows reads every click there as the start of a window move.
+        let nav = h_flex()
+            .occlude()
+            .gap_0p5()
+            .when(self.sidebar_open, |el| el.w(px(SIDEBAR - 24.)))
+            .flex_shrink_0()
+            .child(
+                Button::new("toggle-sidebar")
+                    .ghost()
+                    .xsmall()
+                    .icon(if self.sidebar_open {
+                        IconName::PanelLeftClose
+                    } else {
+                        IconName::PanelLeftOpen
+                    })
+                    .tooltip(if self.sidebar_open {
+                        "Hide sidebar"
+                    } else {
+                        "Show sidebar"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_open = !this.sidebar_open;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("history-back")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ArrowLeft)
+                    .tooltip("Back")
+                    .disabled(!can_back)
+                    .on_click(cx.listener(|this, _, window, cx| this.step(-1, window, cx))),
+            )
+            .child(
+                Button::new("history-forward")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ArrowRight)
+                    .tooltip("Forward")
+                    .disabled(!can_forward)
+                    .on_click(cx.listener(|this, _, window, cx| this.step(1, window, cx))),
+            );
         TitleBar::new().bg(transparent_black()).border_b_0().child(
             h_flex()
                 .flex_1()
                 .min_w_0()
                 .gap_3()
-                .child(
-                    div()
-                        .w(px(SIDEBAR - 24.))
-                        .flex_shrink_0()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("Sorrel"),
-                )
+                .child(nav)
                 .child(left)
                 .when_some(status, |el, (label, color)| {
                     el.child(
@@ -1129,6 +1263,8 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.record_history();
+        let wallpaper_file = self.wallpaper_file(cx);
         let titlebar = self.render_titlebar(window, cx);
         let in_settings = matches!(self.view, View::Settings(_));
         let sidebar = if in_settings {
@@ -1157,7 +1293,7 @@ impl Render for Workspace {
             View::Thread(_) => Backdrop::Session,
             _ => Backdrop::Quiet,
         };
-        let wallpaper = !prefs.wallpaper.is_empty();
+        let wallpaper = wallpaper_file.is_some();
         div()
             .size_full()
             .relative()
@@ -1167,11 +1303,11 @@ impl Render for Workspace {
                 background
             })
             .text_color(foreground)
-            .when(wallpaper, |el| {
+            .when_some(wallpaper_file, |el, file| {
                 el.child(style::wallpaper(
-                    &prefs.wallpaper,
+                    &file,
                     backdrop,
-                    prefs.scanlines,
+                    prefs.effect == proto::Effect::Scanlines,
                     background,
                 ))
             })
@@ -1181,7 +1317,7 @@ impl Render for Workspace {
                         .flex_1()
                         .min_h_0()
                         .items_start()
-                        .child(sidebar)
+                        .when(self.sidebar_open, |el| el.child(sidebar))
                         .child(div().flex_1().min_w_0().h_full().child(main)),
                 ),
             )

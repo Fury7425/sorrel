@@ -17,8 +17,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use proto::{
-    Access, AuthState, OpenIn, Preferences, ProjectId, Provider, ProviderConfig, Request, Theme,
-    TurnSettings,
+    Access, AuthState, Effect, OpenIn, Preferences, ProjectId, Provider, ProviderConfig, Request,
+    Theme, TurnSettings,
 };
 
 use crate::sidebar::{ago, now};
@@ -738,22 +738,20 @@ impl Workspace {
             });
         let effect = self.dropdown(
             "background-effect",
-            div()
-                .child(if prefs.scanlines { "Scanlines" } else { "None" })
-                .into_any_element(),
+            div().child(prefs.effect.label()).into_any_element(),
             140.,
-            vec![
-                choice(
-                    "None",
-                    !prefs.scanlines,
-                    Rc::new(|this: &mut Workspace, cx| this.set_prefs(|p| p.scanlines = false, cx)),
-                ),
-                choice(
-                    "Scanlines",
-                    prefs.scanlines,
-                    Rc::new(|this: &mut Workspace, cx| this.set_prefs(|p| p.scanlines = true, cx)),
-                ),
-            ],
+            Effect::ALL
+                .into_iter()
+                .map(|e| {
+                    choice(
+                        e.label(),
+                        prefs.effect == e,
+                        Rc::new(move |this: &mut Workspace, cx| {
+                            this.set_prefs(|p| p.effect = e, cx)
+                        }),
+                    )
+                })
+                .collect(),
             cx,
         );
 

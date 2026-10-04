@@ -243,12 +243,13 @@ pub fn wallpaper(path: &str, mode: Backdrop, scanlines: bool, background: Hsla) 
         .when(scanlines, |el| el.child(scanline_layer()))
 }
 
-/// Thin dark lines every few pixels, painted in one pass.
+/// Thin dark lines every few pixels, painted live so they stay one screen
+/// pixel thick whatever the wallpaper's size; about 300 quads.
 fn scanline_layer() -> impl IntoElement {
     canvas(
         |_, _, _| (),
         |bounds, _, window, _| {
-            let line = hsla(0., 0., 0., 0.14);
+            let line = hsla(0., 0., 0., 0.18);
             let mut y = bounds.top();
             while y < bounds.bottom() {
                 window.paint_quad(fill(
