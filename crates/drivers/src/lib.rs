@@ -47,6 +47,12 @@ pub struct SessionConfig {
     pub turn_timeout: Duration,
     /// Kill a process that has had no turn for this long.
     pub idle_timeout: Duration,
+    /// A Chat-side conversation: a general assistant with web search and a
+    /// scratch folder for the pages it makes, not a coding agent.
+    pub chat: bool,
+    /// Extra CLI arguments and environment from the Providers page.
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
 }
 
 impl SessionConfig {
@@ -62,6 +68,9 @@ impl SessionConfig {
             blob_dir,
             turn_timeout: Duration::from_secs(600),
             idle_timeout: Duration::from_secs(600),
+            chat: false,
+            args: Vec::new(),
+            env: Vec::new(),
         }
     }
 }

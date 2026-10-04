@@ -32,6 +32,57 @@ use tokio::{
 };
 use ui::{Connection, Workspace};
 
+/// Lucide icons the UI uses beyond gpui-kit's default set (ISC license, see
+/// `assets/icons/LICENSE-LUCIDE`), served in front of the default assets.
+const EXTRA_ICONS: [(&str, &[u8]); 10] = [
+    (
+        "icons/archive.svg",
+        include_bytes!("../assets/icons/archive.svg"),
+    ),
+    (
+        "icons/chart-column.svg",
+        include_bytes!("../assets/icons/chart-column.svg"),
+    ),
+    (
+        "icons/clock.svg",
+        include_bytes!("../assets/icons/clock.svg"),
+    ),
+    (
+        "icons/folder-plus.svg",
+        include_bytes!("../assets/icons/folder-plus.svg"),
+    ),
+    (
+        "icons/layout-grid.svg",
+        include_bytes!("../assets/icons/layout-grid.svg"),
+    ),
+    ("icons/lock.svg", include_bytes!("../assets/icons/lock.svg")),
+    ("icons/plug.svg", include_bytes!("../assets/icons/plug.svg")),
+    (
+        "icons/sliders-horizontal.svg",
+        include_bytes!("../assets/icons/sliders-horizontal.svg"),
+    ),
+    (
+        "icons/text-align-start.svg",
+        include_bytes!("../assets/icons/text-align-start.svg"),
+    ),
+    ("icons/zap.svg", include_bytes!("../assets/icons/zap.svg")),
+];
+
+struct AppAssets;
+
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if let Some((_, bytes)) = EXTRA_ICONS.iter().find(|(p, _)| *p == path) {
+            return Ok(Some(std::borrow::Cow::Borrowed(bytes)));
+        }
+        gpui_kit::assets::Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        gpui_kit::assets::Assets.list(path)
+    }
+}
+
 const USAGE: &str = "usage: sorrel [--in-process | --daemon] [--replay FIXTURE.jsonl [--pace-ms N] [--seed N] [--bench OUT.json]]";
 
 #[derive(Default)]
@@ -83,16 +134,13 @@ fn main() {
     let bench = args.bench;
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            // The window draws its own title bar, so the sidebar and wallpaper reach the top edge.
             let options = WindowOptions {
-                window_bounds: Some(WindowBounds::centered(size(px(1200.), px(820.)), cx)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Sorrel".into()),
-                    ..Default::default()
-                }),
-                ..Default::default()
+                window_bounds: Some(WindowBounds::centered(size(px(1280.), px(840.)), cx)),
+                ..gpui_kit::component::TitleBar::window_options()
             };
             let first_frame = Rc::new(Cell::new(None::<f64>));
             let (window, view) = gpui_kit::open_window(options, cx, |window, cx| {
@@ -177,7 +225,7 @@ fn replay(
     let (requests, mut ignored) = mpsc::channel(256);
     runtime.spawn(async move { while ignored.recv().await.is_some() {} });
     runtime.spawn(async move {
-        let thread = ThreadInfo {
+        let mut thread = ThreadInfo {
             id: 1,
             project: None,
             title: "Replay".into(),
@@ -187,7 +235,11 @@ fn replay(
             needs_input: false,
             queued: 0,
             updated_at: 0,
+            pinned: false,
+            archived: false,
+            failed: false,
             settings: Default::default(),
+            chat: false,
         };
         let opening = [
             Update::Snapshot {
@@ -200,7 +252,7 @@ fn replay(
 Prefer small diffs."
                         .into(),
                 }],
-                threads: vec![thread],
+                threads: vec![thread.clone()],
                 tasks: vec![TaskInfo {
                     id: 1,
                     project: Some(1),
@@ -252,9 +304,12 @@ Prefer small diffs."
                 event: ThreadEvent::Agent(event),
             };
             if ui.send(update).await.is_err() {
-                break;
+                return;
             }
         }
+        // The recorded turn is over, as the engine would report it.
+        thread.running = false;
+        let _ = ui.send(Update::Threads(vec![thread])).await;
     });
     requests
 }

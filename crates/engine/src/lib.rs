@@ -21,8 +21,9 @@ use std::{
 
 use drivers::{DriverCommand, SessionConfig, acp, blob, claude, codex};
 use proto::{
-    AgentEvent, AuthState, AuthStatus, Delivery, McpServer, MsgId, ProjectId, ProjectInfo,
-    Provider, Request, Seq, TaskId, ThreadEvent, ThreadId, ThreadInfo, TurnSettings, Update,
+    AgentEvent, AuthState, AuthStatus, Delivery, McpServer, Mode, MsgId, ProjectId, ProjectInfo,
+    Provider, Request, Seq, StopReason, TaskId, ThreadEvent, ThreadId, ThreadInfo, TurnSettings,
+    Update,
 };
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc};
@@ -30,7 +31,7 @@ use tokio::sync::{broadcast, mpsc};
 pub use files::data_dir;
 
 use checkpoint::Shadow;
-use store::{Store, now};
+use store::{Flag, Store, now};
 
 /// Rows per page when a thread opens or scrolls up.
 const PAGE_ITEMS: usize = 50;
@@ -119,6 +120,9 @@ struct Session {
     pending: usize,
     /// Streamed text not yet written to the log: message, thinking?, text.
     buffer: Option<(MsgId, bool, String)>,
+    /// Tokens the CLI last reported this turn, recorded when it ends.
+    usage: (u64, u64),
+    provider: Provider,
     task: Option<TaskId>,
     last_used: Instant,
 }
@@ -237,7 +241,10 @@ impl Engine {
                 self.notice("Project removed. Its folder and files were kept.", false);
             }
             Request::CreateThread { project, provider } => {
-                let id = self.create_thread(project, provider, NEW_TITLE)?;
+                let id = self.create_thread(project, provider, NEW_TITLE, false)?;
+                db(self
+                    .store
+                    .set_settings(id, &self.default_settings(provider)))?;
                 self.send(Update::Threads(self.threads()?));
                 self.send(Update::Page {
                     thread: id,
@@ -246,6 +253,38 @@ impl Engine {
                     prepend: false,
                     older: None,
                 });
+            }
+            Request::StartThread {
+                project,
+                provider,
+                text,
+                settings,
+                chat,
+            } => {
+                let id = self.create_thread(project, provider, NEW_TITLE, chat)?;
+                if chat != self.settings.prefs.last_chat {
+                    self.settings.prefs.last_chat = chat;
+                    let _ = self.settings.save(&self.dirs.data);
+                }
+                db(self.store.set_settings(id, &settings))?;
+                self.send(Update::Threads(self.threads()?));
+                self.send(Update::Page {
+                    thread: id,
+                    events: Vec::new(),
+                    turn: 0,
+                    prepend: false,
+                    older: None,
+                });
+                self.send_message(id, text, settings, Delivery::Queue)
+                    .await?;
+            }
+            Request::PinThread { id, on } => {
+                db(self.store.set_flag(id, Flag::Pinned, on))?;
+                self.send(Update::Threads(self.threads()?));
+            }
+            Request::ArchiveThread { id, on } => {
+                db(self.store.set_flag(id, Flag::Archived, on))?;
+                self.send(Update::Threads(self.threads()?));
             }
             Request::RenameThread { id, title } => {
                 db(self.store.set_title(id, title.trim()))?;
@@ -319,6 +358,29 @@ impl Engine {
                     .save(&self.dirs.data)
                     .map_err(|e| e.to_string())?;
                 self.send(Update::Settings(self.settings.view(&self.dirs.data)));
+            }
+            Request::SetProviderConfig { provider, config } => {
+                self.settings
+                    .providers
+                    .insert(provider.key().into(), config);
+                self.settings_changed(provider)?;
+            }
+            Request::SetPreferences(prefs) => {
+                self.settings.prefs = prefs;
+                self.settings
+                    .save(&self.dirs.data)
+                    .map_err(|e| e.to_string())?;
+                self.send(Update::Settings(self.settings.view(&self.dirs.data)));
+            }
+            Request::Usage { since } => {
+                let (rows, daily) = db(self.store.usage(since))?;
+                self.send(Update::Usage { rows, daily });
+            }
+            Request::ListDir { path } => {
+                let (path, dirs) = tokio::task::spawn_blocking(move || files::list_dir(&path))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.send(Update::Dir { path, dirs });
             }
             Request::Interrupt { thread } => {
                 self.waiting.retain(|&waiting| waiting != thread);
@@ -496,10 +558,29 @@ impl Engine {
                     needs_input: session.is_some_and(|s| s.pending > 0),
                     queued: session.map_or(0, |s| s.queue.len()),
                     settings: t.settings,
+                    chat: t.chat,
                     updated_at: t.updated_at,
+                    pinned: t.pinned,
+                    archived: t.archived,
+                    failed: t.failed,
                 }
             })
             .collect())
+    }
+
+    /// The composer choices a new thread on `provider` starts with. A model
+    /// only carries over to the provider it belongs to.
+    fn default_settings(&self, provider: Provider) -> TurnSettings {
+        let prefs = &self.settings.prefs;
+        if provider == prefs.provider {
+            prefs.settings.clone()
+        } else {
+            TurnSettings {
+                model: None,
+                effort: None,
+                ..prefs.settings.clone()
+            }
+        }
     }
 
     fn write_instructions(&self, folder: &Path, instructions: &str) -> Result<(), String> {
@@ -512,6 +593,7 @@ impl Engine {
         project: Option<ProjectId>,
         provider: Provider,
         title: &str,
+        chat: bool,
     ) -> Result<ThreadId, String> {
         let folder = match project {
             Some(id) => {
@@ -521,7 +603,9 @@ impl Engine {
             }
             None => self.dirs.chats.clone(),
         };
-        let id = db(self.store.create_thread(project, title, provider, &folder))?;
+        let id = db(self
+            .store
+            .create_thread(project, title, provider, &folder, chat))?;
         if project.is_none() {
             // Each chat gets its own scratch folder; its files are the chat's attachments.
             let folder = self.dirs.chats.join(id.to_string());
@@ -616,8 +700,9 @@ impl Engine {
         self.codex
             .get_or_insert_with(|| {
                 codex::Server::new(
-                    files::resolve_bin(Provider::Codex),
+                    self.settings.bin(Provider::Codex),
                     self.settings.key_for(Provider::Codex),
+                    self.settings.extra(Provider::Codex),
                     self.notice_tx.clone(),
                 )
             })
@@ -632,10 +717,16 @@ impl Engine {
             return Ok(());
         }
         let row = db(self.store.thread(thread))?.ok_or("That thread no longer exists.")?;
+        if self.settings.config(row.provider).disabled {
+            return Err(format!(
+                "{} is turned off in Settings, Providers.",
+                row.provider.label()
+            ));
+        }
         self.write_instructions(&row.folder, &files::read_instructions(&row.folder))?;
 
         let mut cfg = SessionConfig::new(
-            files::resolve_bin(row.provider),
+            self.settings.bin(row.provider),
             row.folder.clone(),
             self.dirs.blobs.clone(),
         );
@@ -644,6 +735,8 @@ impl Engine {
         cfg.mcp_servers = self.settings.mcp_servers.clone();
         cfg.instructions = self.memory.clone();
         cfg.unattended = unattended;
+        cfg.chat = row.chat;
+        (cfg.args, cfg.env) = self.settings.extra(row.provider);
 
         let (command_tx, command_rx) = mpsc::channel(32);
         let (event_tx, mut event_rx) = mpsc::channel(1024);
@@ -676,6 +769,8 @@ impl Engine {
                 queue: VecDeque::new(),
                 pending: 0,
                 buffer: None,
+                usage: (0, 0),
+                provider: row.provider,
                 task: None,
                 last_used: Instant::now(),
             },
@@ -708,6 +803,15 @@ impl Engine {
             return Ok(());
         }
         let row = db(self.store.thread(thread))?.ok_or("That thread no longer exists.")?;
+        // Only Claude has a chat profile; the other CLIs stay read-only in Chat.
+        let settings = if row.chat && row.provider != Provider::Claude {
+            TurnSettings {
+                mode: Mode::Ask,
+                ..settings
+            }
+        } else {
+            settings
+        };
         if row.title == NEW_TITLE {
             let title: String = text
                 .lines()
@@ -820,8 +924,37 @@ impl Engine {
                 });
                 Ok(())
             }
+            AgentEvent::Commands { names } => {
+                if let Some(session) = self.sessions.get(&thread) {
+                    self.send(Update::Commands {
+                        provider: session.provider,
+                        names,
+                    });
+                }
+                Ok(())
+            }
             event => {
                 self.flush(thread);
+                match &event {
+                    AgentEvent::Usage { input, output } => {
+                        if let Some(session) = self.sessions.get_mut(&thread) {
+                            session.usage = (*input, *output);
+                        }
+                    }
+                    AgentEvent::TurnEnded { reason } => {
+                        let failed = matches!(reason, StopReason::Error | StopReason::Timeout);
+                        let _ = self.store.set_flag(thread, Flag::Failed, failed);
+                        if let Some(session) = self.sessions.get_mut(&thread) {
+                            let (input, output) = std::mem::take(&mut session.usage);
+                            if input + output > 0 {
+                                let _ =
+                                    self.store
+                                        .add_usage(thread, session.provider, input, output);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 if let AgentEvent::SessionStarted { session_id, .. } = &event {
                     let _ = self.store.set_session(thread, session_id);
                 }
@@ -997,11 +1130,16 @@ impl Engine {
             .into_iter()
             .filter(|&p| self.settings.key_for(p).is_some())
             .collect();
+        let setup: Vec<(Provider, PathBuf, bool)> = Provider::ALL
+            .into_iter()
+            .map(|p| (p, self.settings.bin(p), self.settings.config(p).disabled))
+            .collect();
         tokio::spawn(async move {
             let mut statuses = Vec::new();
-            for provider in Provider::ALL {
-                let bin = files::resolve_bin(provider);
-                let (state, detail) = if keyed.contains(&provider) {
+            for (provider, bin, disabled) in setup {
+                let (state, detail) = if disabled {
+                    (AuthState::Unknown, "Turned off".to_owned())
+                } else if keyed.contains(&provider) {
                     (AuthState::ApiKey, "Using your API key".to_owned())
                 } else {
                     match provider {
@@ -1068,7 +1206,7 @@ impl Engine {
                 _ => {
                     let title: String =
                         format!("Task: {}", task.prompt.chars().take(50).collect::<String>());
-                    self.create_thread(task.project, task.provider, &title)?
+                    self.create_thread(task.project, task.provider, &title, false)?
                 }
             };
             self.ensure_session(thread, true)?;

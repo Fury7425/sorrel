@@ -8,7 +8,9 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use proto::{FileContent, FileEntry, McpServer, Provider, SettingsView};
+use proto::{
+    FileContent, FileEntry, McpServer, Preferences, Provider, ProviderConfig, SettingsView,
+};
 use serde::{Deserialize, Serialize};
 
 /// `$SORREL_DATA_DIR`, else the platform's per-user data folder.
@@ -88,6 +90,9 @@ pub struct Settings {
     pub max_sessions: usize,
     /// Starred models as `(provider key, model id)`.
     pub favorites: Vec<(String, String)>,
+    /// By provider key.
+    pub providers: BTreeMap<String, ProviderConfig>,
+    pub prefs: Preferences,
 }
 
 impl Settings {
@@ -124,6 +129,28 @@ impl Settings {
         self.api_keys.get(provider.key()).cloned()
     }
 
+    pub fn config(&self, provider: Provider) -> ProviderConfig {
+        self.providers
+            .get(provider.key())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The Providers page's binary path, else the usual lookup.
+    pub fn bin(&self, provider: Provider) -> PathBuf {
+        match self.config(provider).binary.trim() {
+            "" => resolve_bin(provider),
+            path => PathBuf::from(path),
+        }
+    }
+
+    /// Extra arguments and environment for the provider's CLI.
+    pub fn extra(&self, provider: Provider) -> (Vec<String>, Vec<(String, String)>) {
+        let config = self.config(provider);
+        let args = config.args.split_whitespace().map(str::to_owned).collect();
+        (args, config.env)
+    }
+
     pub fn view(&self, data_dir: &Path) -> SettingsView {
         let pick = |keys: Vec<&String>| -> Vec<Provider> {
             keys.into_iter()
@@ -143,6 +170,11 @@ impl Settings {
                     Some((Provider::from_key(provider)?, model.clone()))
                 })
                 .collect(),
+            providers: Provider::ALL
+                .into_iter()
+                .map(|provider| (provider, self.config(provider)))
+                .collect(),
+            prefs: self.prefs.clone(),
         }
     }
 }
@@ -317,6 +349,38 @@ pub fn read_file(root: &Path, rel: &str) -> io::Result<FileContent> {
         Ok(text) => Ok(FileContent::Text { text, ext }),
         Err(_) => Ok(FileContent::Binary(path)),
     }
+}
+
+/// The folders inside `path` (`~` is home, empty is home), skipping hidden
+/// ones. Returns the resolved path with a trailing separator.
+pub fn list_dir(path: &str) -> (String, Vec<String>) {
+    const MAX_DIRS: usize = 500;
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let path = path.trim();
+    let dir = match path.strip_prefix('~') {
+        Some(rest) => home.join(rest.trim_start_matches(['/', '\\'])),
+        None if path.is_empty() => home,
+        None => PathBuf::from(path),
+    };
+    let mut dirs: Vec<String> = fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| !name.starts_with('.') && !name.starts_with('$'))
+                .take(MAX_DIRS)
+                .collect()
+        })
+        .unwrap_or_default();
+    dirs.sort_by_key(|name| name.to_lowercase());
+    let mut shown = dir.to_string_lossy().into_owned();
+    if !shown.ends_with(['/', '\\']) {
+        shown.push(std::path::MAIN_SEPARATOR);
+    }
+    (shown, dirs)
 }
 
 /// A new folder under `parent` named after `name`.

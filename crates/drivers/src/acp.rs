@@ -276,10 +276,11 @@ impl Agent {
         resume: Option<&str>,
     ) -> Result<(Agent, mpsc::Receiver<Incoming>), String> {
         let mut cmd = crate::command(&cfg.bin);
-        cmd.args(&launch.args).current_dir(&cfg.cwd);
+        cmd.args(&launch.args).args(&cfg.args).current_dir(&cfg.cwd);
         if let Some(key) = &cfg.api_key {
             cmd.env(launch.key_env, key);
         }
+        cmd.envs(cfg.env.iter().map(|(k, v)| (k, v)));
         let mut child = cmd.spawn().map_err(|e| crate::spawn_error(&cfg.bin, &e))?;
         let stderr = StderrTail::drain(child.stderr.take().expect("stderr is piped"));
         let (peer, mut incoming) = Peer::start(

@@ -49,6 +49,8 @@ type Routes = Arc<Mutex<HashMap<String, mpsc::Sender<Incoming>>>>;
 pub struct Server {
     bin: PathBuf,
     api_key: Option<String>,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
     peer: Arc<tokio::sync::Mutex<Option<Peer>>>,
     routes: Routes,
     /// Notifications that belong to no thread, such as `account/login/completed`.
@@ -59,11 +61,14 @@ impl Server {
     pub fn new(
         bin: PathBuf,
         api_key: Option<String>,
+        (args, env): (Vec<String>, Vec<(String, String)>),
         notices: mpsc::Sender<(String, Value)>,
     ) -> Self {
         Self {
             bin,
             api_key,
+            args,
+            env,
             peer: Arc::default(),
             routes: Arc::default(),
             notices,
@@ -86,6 +91,8 @@ impl Server {
         if let Some(key) = &self.api_key {
             cmd.env("OPENAI_API_KEY", key);
         }
+        cmd.args(&self.args)
+            .envs(self.env.iter().map(|(k, v)| (k, v)));
         let mut child = cmd.spawn().map_err(|e| crate::spawn_error(&self.bin, &e))?;
         let stderr = StderrTail::drain(child.stderr.take().expect("stderr is piped"));
         let (peer, mut incoming) = Peer::start(
@@ -464,7 +471,10 @@ fn policy(settings: &TurnSettings, unattended: bool) -> (&'static str, Value) {
         (true, ..) => ("never", write),
         (false, Mode::Plan | Mode::Ask, _) => ("on-request", read),
         // Codex applies edits inside the workspace without asking in this sandbox.
-        (false, Mode::Agent, Access::Supervised | Access::AutoEdits) => ("on-request", write),
+        // ponytail: Auto maps to on-request, which already lets Codex decide when to ask.
+        (false, Mode::Agent, Access::Supervised | Access::AutoEdits | Access::Auto) => {
+            ("on-request", write)
+        }
         (false, Mode::Agent, Access::FullAccess) => ("never", full),
     }
 }

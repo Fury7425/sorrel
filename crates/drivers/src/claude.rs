@@ -25,7 +25,7 @@ use std::{
 
 use proto::{
     Access, AgentEvent, AuthState, McpServer, Mode, ModelInfo, MsgId, PermChoice, Question,
-    StopReason, TodoItem, TodoStatus, ToolKind, ToolStatus, TurnSettings,
+    StopReason, TodoItem, TodoStatus, ToolKind, ToolStatus, TurnSettings, ULTRACODE, ULTRATHINK,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -43,9 +43,11 @@ const WRITE_TOOLS: [&str; 4] = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
 /// The models the picker offers. The CLI has no list command, so these are
 /// its documented aliases plus a pinned small model.
 pub fn models() -> Vec<ModelInfo> {
-    let efforts: Vec<String> = ["low", "medium", "high", "xhigh", "max"]
-        .map(String::from)
-        .to_vec();
+    let efforts: Vec<String> = [
+        "low", "medium", "high", "xhigh", "max", ULTRATHINK, ULTRACODE,
+    ]
+    .map(String::from)
+    .to_vec();
     [
         ("fable", "Fable", "Most capable"),
         ("opus", "Opus", "Deep reasoning for hard work"),
@@ -134,8 +136,9 @@ pub async fn run(
                 let Some(command) = command else { break };
                 match command {
                     DriverCommand::Prompt { text, settings: wanted, steer } => {
-                        // The effort is fixed when claude starts: switch it between turns by restarting.
-                        if process.is_some() && !in_turn && wanted.effort != current.effort {
+                        // Effort, fast mode, Ultracode and the context window are fixed when
+                        // claude starts: switch them between turns by restarting.
+                        if process.is_some() && !in_turn && Launch::of(&wanted) != Launch::of(&current) {
                             process = None;
                         }
                         if process.is_none() {
@@ -164,11 +167,13 @@ pub async fn run(
                         }
                         if written.is_ok() && wanted.model != current.model {
                             next_request += 1;
-                            let request = json!({ "subtype": "set_model", "model": wanted.model });
+                            let request = json!({ "subtype": "set_model", "model": model_name(&wanted) });
                             written = running.write(&control_request(next_request, request)).await;
                         }
+                        let ultrathink = wanted.effort.as_deref() == Some(ULTRATHINK);
                         current = TurnSettings { effort: current.effort.clone(), ..wanted };
                         if written.is_ok() {
+                            let text = if ultrathink { ultrathink_prompt(&text) } else { text };
                             written = running.write(&user_line(&text, steer && in_turn)).await;
                         }
                         if let Err(e) = written {
@@ -334,10 +339,20 @@ impl Translator {
         // Subagent traffic carries a parent tool id; it is not the main transcript.
         let main = v["parent_tool_use_id"].is_null();
         match v["type"].as_str() {
-            Some("system") if v["subtype"] == "init" => out.push(AgentEvent::SessionStarted {
-                session_id: string(&v["session_id"]),
-                model: string(&v["model"]),
-            }),
+            Some("system") if v["subtype"] == "init" => {
+                out.push(AgentEvent::SessionStarted {
+                    session_id: string(&v["session_id"]),
+                    model: string(&v["model"]),
+                });
+                if let Some(names) = v["slash_commands"].as_array().filter(|n| !n.is_empty()) {
+                    out.push(AgentEvent::Commands {
+                        names: names
+                            .iter()
+                            .filter_map(|n| n.as_str().map(str::to_owned))
+                            .collect(),
+                    });
+                }
+            }
             Some("stream_event") if main => {
                 let event = &v["event"];
                 match event["type"].as_str() {
@@ -659,11 +674,80 @@ fn string(v: &Value) -> String {
     v.as_str().unwrap_or_default().to_owned()
 }
 
+/// What `claude` takes at launch and keeps for the life of the process.
+#[derive(PartialEq)]
+struct Launch {
+    effort: Option<String>,
+    fast: bool,
+    ultracode: bool,
+    long_context: bool,
+}
+
+impl Launch {
+    fn of(settings: &TurnSettings) -> Launch {
+        let effort = match settings.effort.as_deref() {
+            // Ultrathink is a word in the prompt, not a level: keep the model's own.
+            Some(ULTRATHINK) => None,
+            Some(ULTRACODE) => Some("xhigh".to_owned()),
+            other => other.map(str::to_owned),
+        };
+        Launch {
+            effort,
+            fast: settings.fast,
+            ultracode: settings.effort.as_deref() == Some(ULTRACODE),
+            long_context: settings.long_context,
+        }
+    }
+
+    /// Flag settings for `--settings`; `None` when there are none.
+    fn settings_json(&self) -> Option<String> {
+        let mut flags = serde_json::Map::new();
+        if self.fast {
+            flags.insert("fastMode".into(), Value::Bool(true));
+        }
+        if self.ultracode {
+            flags.insert("ultracode".into(), Value::Bool(true));
+        }
+        (!flags.is_empty()).then(|| Value::Object(flags).to_string())
+    }
+}
+
+/// Claude Code reasons as long as it needs on a turn that starts with the
+/// keyword. Slash commands stay as they are, since a prefix would break them.
+fn ultrathink_prompt(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with('/') || trimmed.starts_with("Ultrathink:") {
+        trimmed.to_owned()
+    } else {
+        format!("Ultrathink:\n{trimmed}")
+    }
+}
+
+/// The model as `claude` names it: `[1m]` asks for the long context window.
+fn model_name(settings: &TurnSettings) -> Option<String> {
+    let model = settings.model.as_deref()?;
+    Some(if settings.long_context && !model.ends_with("[1m]") {
+        format!("{model}[1m]")
+    } else {
+        model.to_owned()
+    })
+}
+
+/// The system prompt that replaces Claude Code's own on the Chat side.
+const CHAT_PROMPT: &str = "You are a helpful, friendly assistant in a desktop chat app. Answer directly and \
+conversationally, in the language the user writes in. Use Markdown when it helps. Search the web when a \
+question needs current information. When the user asks for a document, page or other file, write it into \
+the current folder with the Write tool and say its file name; the app shows it as a card the user can open.";
+
+/// Tools a Chat conversation may use: look things up and make files in its own folder.
+const CHAT_TOOLS: &str = "WebSearch,WebFetch,Read,Write";
+
 fn permission_mode(settings: &TurnSettings) -> &'static str {
     match (settings.mode, settings.access) {
         (Mode::Plan, _) => "plan",
         (_, Access::Supervised) => "default",
         (_, Access::AutoEdits) => "acceptEdits",
+        (_, Access::Auto) => "auto",
         (_, Access::FullAccess) => "bypassPermissions",
     }
 }
@@ -746,11 +830,25 @@ impl Process {
                 "--allow-dangerously-skip-permissions",
             ]);
         }
-        if let Some(model) = &settings.model {
-            cmd.args(["--model", model]);
+        let launch = Launch::of(settings);
+        if let Some(model) = model_name(settings) {
+            cmd.args(["--model", &model]);
         }
-        if let Some(effort) = &settings.effort {
+        if let Some(effort) = &launch.effort {
             cmd.args(["--effort", effort]);
+        }
+        if let Some(flags) = launch.settings_json() {
+            cmd.args(["--settings", &flags]);
+        }
+        if cfg.chat {
+            // A general assistant: its own prompt, no shell or code edits, files only in its folder.
+            cmd.args([
+                "--system-prompt",
+                CHAT_PROMPT,
+                "--tools",
+                CHAT_TOOLS,
+                "--restricted",
+            ]);
         }
         if let Some(id) = resume {
             cmd.args(["--resume", id]);
@@ -761,6 +859,8 @@ impl Process {
         if let Some(key) = &cfg.api_key {
             cmd.env("ANTHROPIC_API_KEY", key);
         }
+        cmd.args(&cfg.args)
+            .envs(cfg.env.iter().map(|(k, v)| (k, v)));
         cmd.current_dir(&cfg.cwd);
         let mut child = cmd.spawn().map_err(|e| crate::spawn_error(&cfg.bin, &e))?;
         let stdin = child.stdin.take().expect("stdin is piped");

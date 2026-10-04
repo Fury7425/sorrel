@@ -78,17 +78,25 @@ pub enum Access {
     Supervised,
     /// Apply edits without asking; ask before anything else.
     AutoEdits,
+    /// The CLI approves routine actions itself and asks about risky ones.
+    Auto,
     /// Run commands and edits without prompts.
     FullAccess,
 }
 
 impl Access {
-    pub const ALL: [Access; 3] = [Access::Supervised, Access::AutoEdits, Access::FullAccess];
+    pub const ALL: [Access; 4] = [
+        Access::Supervised,
+        Access::AutoEdits,
+        Access::Auto,
+        Access::FullAccess,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Access::Supervised => "Supervised",
             Access::AutoEdits => "Auto-accept edits",
+            Access::Auto => "Auto",
             Access::FullAccess => "Full access",
         }
     }
@@ -97,6 +105,7 @@ impl Access {
         match self {
             Access::Supervised => "Ask before commands and file changes.",
             Access::AutoEdits => "Apply edits without asking, ask before other actions.",
+            Access::Auto => "The CLI approves routine actions; risky ones still ask.",
             Access::FullAccess => "Allow commands and edits without prompts.",
         }
     }
@@ -112,7 +121,16 @@ pub struct TurnSettings {
     pub effort: Option<String>,
     pub mode: Mode,
     pub access: Access,
+    /// Claude's fast mode: the same model with quicker output.
+    pub fast: bool,
+    /// The model's 1M-token context window instead of its default.
+    pub long_context: bool,
 }
+
+/// Effort values past `max` that Claude Code takes as switches rather than
+/// as `--effort` levels.
+pub const ULTRATHINK: &str = "ultrathink";
+pub const ULTRACODE: &str = "ultracode";
 
 /// One entry in a provider's model list.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -247,6 +265,10 @@ pub enum AgentEvent {
     Error {
         message: String,
     },
+    /// The slash commands and skills the CLI offers. Not logged.
+    Commands {
+        names: Vec<String>,
+    },
 }
 
 /// One entry in a thread's event log.
@@ -283,6 +305,7 @@ impl ThreadEvent {
                 AgentEvent::SessionStarted { .. }
                     | AgentEvent::ToolUpdate { .. }
                     | AgentEvent::Usage { .. }
+                    | AgentEvent::Commands { .. }
             ),
         }
     }
@@ -398,7 +421,7 @@ impl Transcript {
 
     fn apply_agent(&mut self, event: &AgentEvent) -> Option<usize> {
         match event {
-            AgentEvent::SessionStarted { .. } => None,
+            AgentEvent::SessionStarted { .. } | AgentEvent::Commands { .. } => None,
             AgentEvent::TextDelta { msg_id, text } => {
                 if let Some(Item::Assistant {
                     msg_id: id,
@@ -548,8 +571,14 @@ pub struct ThreadInfo {
     pub needs_input: bool,
     pub queued: usize,
     pub updated_at: i64,
+    pub pinned: bool,
+    pub archived: bool,
+    /// The last turn ended in an error.
+    pub failed: bool,
     /// The composer's last choices for this thread.
     pub settings: TurnSettings,
+    /// A plain conversation (Chat) rather than a coding session (Code).
+    pub chat: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -593,6 +622,91 @@ pub struct McpServer {
     pub env: Vec<(String, String)>,
 }
 
+/// How Sorrel runs one CLI, set on the Providers page.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderConfig {
+    /// Hidden from pickers and never started.
+    pub disabled: bool,
+    /// Empty finds the CLI on PATH.
+    pub binary: String,
+    /// Extra arguments, split on whitespace.
+    pub args: String,
+    pub env: Vec<(String, String)>,
+}
+
+/// Which side of the app opens first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenIn {
+    Chat,
+    #[default]
+    Code,
+    Last,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Theme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+/// The General and Appearance pages.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Preferences {
+    /// The CLI and composer choices a new thread starts with.
+    pub provider: Provider,
+    pub settings: TurnSettings,
+    /// Enter steers a running turn instead of queueing; Ctrl+Enter does the other.
+    pub enter_steers: bool,
+    pub theme: Theme,
+    pub check_updates: bool,
+    /// An image behind the new-thread screen; empty for none.
+    pub wallpaper: String,
+    /// See-through, blurred window background where the OS supports it.
+    pub glass: bool,
+    /// Display-line texture over the wallpaper.
+    pub scanlines: bool,
+    /// `#rrggbb`, or empty for the theme's own.
+    pub accent: String,
+    pub open_in: OpenIn,
+    /// The side last shown, for `OpenIn::Last`.
+    pub last_chat: bool,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Preferences {
+            provider: Provider::Claude,
+            settings: TurnSettings::default(),
+            enter_steers: false,
+            theme: Theme::System,
+            check_updates: true,
+            wallpaper: String::new(),
+            glass: true,
+            scanlines: true,
+            accent: String::new(),
+            open_in: OpenIn::Code,
+            last_chat: false,
+        }
+    }
+}
+
+/// Tokens one CLI reported over a period.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UsageRow {
+    pub provider: Provider,
+    pub input: u64,
+    pub output: u64,
+    pub turns: u64,
+    pub threads: u64,
+}
+
+/// Totals per CLI, and tokens per day as `(day start, tokens)`.
+pub type UsageReport = (Vec<UsageRow>, Vec<(i64, u64)>);
+
 /// Settings as the UI sees them. API keys never leave the engine; the UI only
 /// learns whether one is stored.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -604,6 +718,8 @@ pub struct SettingsView {
     pub data_dir: PathBuf,
     /// Starred models, as `(provider, model id)`.
     pub favorites: Vec<(Provider, String)>,
+    pub providers: Vec<(Provider, ProviderConfig)>,
+    pub prefs: Preferences,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -648,6 +764,22 @@ pub enum Request {
         project: Option<ProjectId>,
         provider: Provider,
     },
+    /// Creates a thread and sends its first message in one go.
+    StartThread {
+        project: Option<ProjectId>,
+        provider: Provider,
+        text: String,
+        settings: TurnSettings,
+        chat: bool,
+    },
+    PinThread {
+        id: ThreadId,
+        on: bool,
+    },
+    ArchiveThread {
+        id: ThreadId,
+        on: bool,
+    },
     RenameThread {
         id: ThreadId,
         title: String,
@@ -687,6 +819,19 @@ pub enum Request {
     },
     SetMaxSessions {
         count: usize,
+    },
+    SetProviderConfig {
+        provider: Provider,
+        config: ProviderConfig,
+    },
+    SetPreferences(Preferences),
+    /// Token totals since a Unix time.
+    Usage {
+        since: i64,
+    },
+    /// The folders inside `path` (home when empty), for the add-project browser.
+    ListDir {
+        path: String,
     },
     Interrupt {
         thread: ThreadId,
@@ -813,6 +958,21 @@ pub enum Update {
     Models {
         provider: Provider,
         models: Vec<ModelInfo>,
+    },
+    /// Totals per CLI, and per day as `(day start, tokens)`.
+    Usage {
+        rows: Vec<UsageRow>,
+        daily: Vec<(i64, u64)>,
+    },
+    /// `path` as resolved, and the names of the folders in it.
+    Dir {
+        path: String,
+        dirs: Vec<String>,
+    },
+    /// What `/` offers in a provider's composer.
+    Commands {
+        provider: Provider,
+        names: Vec<String>,
     },
     /// A newer release exists; `url` is its download page.
     UpdateAvailable {

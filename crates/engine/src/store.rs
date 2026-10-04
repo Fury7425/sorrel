@@ -4,7 +4,10 @@
 
 use std::path::{Path, PathBuf};
 
-use proto::{ProjectId, Provider, Seq, TaskId, TaskInfo, ThreadEvent, ThreadId, TurnSettings};
+use proto::{
+    ProjectId, Provider, Seq, TaskId, TaskInfo, ThreadEvent, ThreadId, TurnSettings, UsageReport,
+    UsageRow,
+};
 use rusqlite::{Connection, OptionalExtension, Result, Row, params};
 
 const SCHEMA: &str = "
@@ -53,7 +56,34 @@ CREATE TABLE IF NOT EXISTS tasks(
     thread_id INTEGER REFERENCES threads(id) ON DELETE SET NULL,
     last_status TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS usage(
+    thread_id INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    input INTEGER NOT NULL,
+    output INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS usage_by_time ON usage(at);
 ";
+
+/// Columns added after the first release; adding one twice is the only failure.
+const MIGRATIONS: [&str; 5] = [
+    "ALTER TABLE threads ADD COLUMN settings TEXT",
+    "ALTER TABLE threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE threads ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE threads ADD COLUMN failed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE threads ADD COLUMN chat INTEGER NOT NULL DEFAULT 0",
+];
+
+const THREAD_COLUMNS: &str = "id, project_id, title, provider, folder, session, turns, updated_at, settings, pinned, archived, failed, chat";
+
+/// A thread's on/off columns.
+#[derive(Clone, Copy)]
+pub enum Flag {
+    Pinned,
+    Archived,
+    Failed,
+}
 
 pub struct Store {
     db: Connection,
@@ -75,6 +105,10 @@ pub struct ThreadRow {
     pub turns: u32,
     pub updated_at: i64,
     pub settings: TurnSettings,
+    pub pinned: bool,
+    pub archived: bool,
+    pub failed: bool,
+    pub chat: bool,
 }
 
 pub fn now() -> i64 {
@@ -104,8 +138,9 @@ impl Store {
 
     fn init(db: Connection) -> Result<Store> {
         db.execute_batch(SCHEMA)?;
-        // Databases from before per-thread settings lack the column; adding it twice is the only failure.
-        let _ = db.execute_batch("ALTER TABLE threads ADD COLUMN settings TEXT");
+        for migration in MIGRATIONS {
+            let _ = db.execute_batch(migration);
+        }
         Ok(Store { db })
     }
 
@@ -171,10 +206,11 @@ impl Store {
         title: &str,
         provider: Provider,
         folder: &Path,
+        chat: bool,
     ) -> Result<ThreadId> {
         self.db.execute(
-            "INSERT INTO threads(project_id, title, provider, folder, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![project, title, provider.key(), text(folder), now()],
+            "INSERT INTO threads(project_id, title, provider, folder, updated_at, chat) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![project, title, provider.key(), text(folder), now(), chat],
         )?;
         Ok(self.db.last_insert_rowid())
     }
@@ -220,6 +256,19 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_flag(&self, id: ThreadId, flag: Flag, on: bool) -> Result<()> {
+        let column = match flag {
+            Flag::Pinned => "pinned",
+            Flag::Archived => "archived",
+            Flag::Failed => "failed",
+        };
+        self.db.execute(
+            &format!("UPDATE threads SET {column} = ?2 WHERE id = ?1"),
+            params![id, on],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_thread(&self, id: ThreadId) -> Result<()> {
         self.db
             .execute("DELETE FROM threads WHERE id = ?1", params![id])?;
@@ -241,14 +290,17 @@ impl Store {
                 .get::<_, Option<String>>(8)?
                 .and_then(|json| serde_json::from_str(&json).ok())
                 .unwrap_or_default(),
+            pinned: r.get(9)?,
+            archived: r.get(10)?,
+            failed: r.get(11)?,
+            chat: r.get(12)?,
         })
     }
 
     pub fn threads(&self) -> Result<Vec<ThreadRow>> {
-        let mut stmt = self.db.prepare(
-            "SELECT id, project_id, title, provider, folder, session, turns, updated_at, settings
-             FROM threads ORDER BY updated_at DESC",
-        )?;
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {THREAD_COLUMNS} FROM threads ORDER BY updated_at DESC"
+        ))?;
         let rows = stmt.query_map([], Self::thread_row)?;
         rows.collect()
     }
@@ -256,8 +308,7 @@ impl Store {
     pub fn thread(&self, id: ThreadId) -> Result<Option<ThreadRow>> {
         self.db
             .query_row(
-                "SELECT id, project_id, title, provider, folder, session, turns, updated_at, settings
-                 FROM threads WHERE id = ?1",
+                &format!("SELECT {THREAD_COLUMNS} FROM threads WHERE id = ?1"),
                 params![id],
                 Self::thread_row,
             )
@@ -339,6 +390,52 @@ impl Store {
             None => None,
         };
         Ok((events, first.map(|(_, turn)| turn).unwrap_or(0), older))
+    }
+
+    // Usage.
+
+    pub fn add_usage(
+        &self,
+        thread: ThreadId,
+        provider: Provider,
+        input: u64,
+        output: u64,
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO usage(thread_id, provider, at, input, output) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![thread, provider.key(), now(), input as i64, output as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Totals per provider since `since`, and tokens per day (UTC).
+    pub fn usage(&self, since: i64) -> Result<UsageReport> {
+        let mut stmt = self.db.prepare(
+            "SELECT provider, SUM(input), SUM(output), COUNT(*), COUNT(DISTINCT thread_id)
+             FROM usage WHERE at >= ?1 GROUP BY provider ORDER BY SUM(input) + SUM(output) DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![since], |r| {
+                let provider: String = r.get(0)?;
+                Ok(UsageRow {
+                    provider: Provider::from_key(&provider).unwrap_or(Provider::Claude),
+                    input: r.get::<_, i64>(1)? as u64,
+                    output: r.get::<_, i64>(2)? as u64,
+                    turns: r.get::<_, i64>(3)? as u64,
+                    threads: r.get::<_, i64>(4)? as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        let mut stmt = self.db.prepare(
+            "SELECT at / 86400 * 86400 AS day, SUM(input + output) FROM usage
+             WHERE at >= ?1 GROUP BY day ORDER BY day",
+        )?;
+        let daily = stmt
+            .query_map(params![since], |r| {
+                Ok((r.get(0)?, r.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok((rows, daily))
     }
 
     // Checkpoints.
@@ -465,7 +562,7 @@ mod tests {
     fn pages_start_on_a_row_and_carry_the_turn_count() {
         let store = Store::in_memory().unwrap();
         let thread = store
-            .create_thread(None, "t", Provider::Claude, Path::new("/tmp"))
+            .create_thread(None, "t", Provider::Claude, Path::new("/tmp"), false)
             .unwrap();
         for i in 0..5 {
             store
@@ -517,10 +614,41 @@ mod tests {
     }
 
     #[test]
+    fn usage_totals_per_provider_and_flags_round_trip() {
+        let store = Store::in_memory().unwrap();
+        let a = store
+            .create_thread(None, "a", Provider::Claude, Path::new("/tmp"), false)
+            .unwrap();
+        let b = store
+            .create_thread(None, "b", Provider::Codex, Path::new("/tmp"), false)
+            .unwrap();
+        store.add_usage(a, Provider::Claude, 10, 1).unwrap();
+        store.add_usage(a, Provider::Claude, 20, 2).unwrap();
+        store.add_usage(b, Provider::Codex, 5, 5).unwrap();
+        let (rows, daily) = store.usage(0).unwrap();
+        assert_eq!(rows[0].provider, Provider::Claude);
+        assert_eq!(
+            (
+                rows[0].input,
+                rows[0].output,
+                rows[0].turns,
+                rows[0].threads
+            ),
+            (30, 3, 2, 1)
+        );
+        assert_eq!(daily.iter().map(|d| d.1).sum::<u64>(), 43);
+        assert!(store.usage(now() + 10).unwrap().0.is_empty());
+
+        store.set_flag(a, Flag::Pinned, true).unwrap();
+        let row = store.thread(a).unwrap().unwrap();
+        assert!(row.pinned && !row.archived && !row.failed);
+    }
+
+    #[test]
     fn checkpoints_merge_before_and_after() {
         let store = Store::in_memory().unwrap();
         let thread = store
-            .create_thread(None, "t", Provider::Codex, Path::new("/tmp"))
+            .create_thread(None, "t", Provider::Codex, Path::new("/tmp"), false)
             .unwrap();
         store.set_checkpoint(thread, 1, Some("a"), None).unwrap();
         store.set_checkpoint(thread, 1, None, Some("b")).unwrap();

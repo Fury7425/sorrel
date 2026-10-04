@@ -1,31 +1,38 @@
-//! The window, laid out like T3 Code: a sidebar of threads grouped under
-//! their projects, the open thread, and a settings page with its own nav.
-//! It renders [`Update`]s and sends [`Request`]s; it never sees a vendor's
-//! wire format, spawns a process or touches the database.
+//! The window: a title bar, a sidebar of sessions (Code) or chats (Chat),
+//! the open conversation or the new-thread screen, and settings pages, all
+//! over an optional wallpaper. It renders [`Update`]s and sends
+//! [`Request`]s; it never sees a vendor's wire format, spawns a process or
+//! touches the database.
 
+mod settings;
+mod sidebar;
+mod style;
 mod thread;
 
 use std::collections::{HashMap, VecDeque};
 
 use gpui_kit::component::{
-    ActiveTheme as _, IconName, Selectable as _, Sizable as _,
+    ActiveTheme as _, IconName, Selectable as _, Sizable as _, Theme, ThemeMode, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputState, Textarea, TextareaState},
+    input::{Input, InputEvent, InputState, TextareaState},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use proto::{
-    AuthState, AuthStatus, ModelInfo, ProjectId, ProjectInfo, Provider, Request, SettingsView,
-    TaskInfo, ThreadId, ThreadInfo, Update,
+    AuthStatus, ModelInfo, OpenIn, Preferences, ProjectId, ProjectInfo, Provider, Request,
+    SettingsView, TaskInfo, ThreadId, ThreadInfo, TurnSettings, Update, UsageReport,
 };
 use tokio::sync::mpsc;
 
 pub use thread::ThreadView;
 
-/// Notices kept on screen; older ones scroll off.
-const MAX_NOTICES: usize = 4;
+use style::{Backdrop, SIDEBAR};
+use thread::Look;
+
+/// Notices kept on screen; older ones drop off.
+const MAX_NOTICES: usize = 3;
 
 /// A client's link to the engine, in-process or over the daemon socket.
 pub struct Connection {
@@ -46,50 +53,48 @@ pub enum Screen {
 #[derive(Clone, Copy, PartialEq)]
 enum Section {
     General,
+    Appearance,
     Providers,
     Connectors,
     Tasks,
+    Archived,
     About,
-}
-
-impl Section {
-    const ALL: [Section; 5] = [
-        Section::General,
-        Section::Providers,
-        Section::Connectors,
-        Section::Tasks,
-        Section::About,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            Section::General => "General",
-            Section::Providers => "Providers",
-            Section::Connectors => "Connectors",
-            Section::Tasks => "Scheduled tasks",
-            Section::About => "About",
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum View {
+    /// The new-thread (Code) or new-chat (Chat) screen.
     Home,
     Thread(ThreadId),
     Project(ProjectId),
     Settings(Section),
+    Usage,
+}
+
+/// The add-project dialog's steps.
+#[derive(Clone, Copy, PartialEq)]
+enum Palette {
+    Sources,
+    Browse,
+    Create,
 }
 
 struct Editors {
-    new_project: Entity<InputState>,
-    new_project_folder: Entity<InputState>,
-    project_name: Entity<InputState>,
-    instructions: Entity<TextareaState>,
     memory: Entity<TextareaState>,
     mcp: Entity<TextareaState>,
     keys: Vec<(Provider, Entity<InputState>)>,
+    binaries: Vec<(Provider, Entity<InputState>)>,
+    args: Vec<(Provider, Entity<InputState>)>,
+    env_key: Entity<InputState>,
+    env_value: Entity<InputState>,
     task_prompt: Entity<TextareaState>,
     task_every: Entity<InputState>,
+    project_name: Entity<InputState>,
+    instructions: Entity<TextareaState>,
+    search: Entity<InputState>,
+    rename: Entity<InputState>,
+    path: Entity<InputState>,
+    new_project: Entity<InputState>,
 }
 
 pub struct Workspace {
@@ -100,16 +105,33 @@ pub struct Workspace {
     auth: Vec<AuthStatus>,
     settings: SettingsView,
     catalog: HashMap<Provider, Vec<ModelInfo>>,
+    commands: HashMap<Provider, Vec<String>>,
+    /// Chat side rather than Code side.
+    chat: bool,
+    /// The opening side was chosen from the preferences.
+    started: bool,
     view: View,
     thread: Option<Entity<ThreadView>>,
-    /// The CLI new threads start on; the thread's model picker can change it.
-    provider: Provider,
+    code_draft: Entity<ThreadView>,
+    chat_draft: Entity<ThreadView>,
+    project_filter: Option<ProjectId>,
+    filter_open: bool,
+    palette: Option<Palette>,
+    dir: (String, Vec<String>),
+    /// The provider open on the Providers page.
+    provider_page: Provider,
     task_project: Option<ProjectId>,
-    adding_project: bool,
+    task_provider: Provider,
+    usage: Option<UsageReport>,
+    usage_days: i64,
+    renaming: Option<ThreadId>,
     notices: VecDeque<(SharedString, bool)>,
     update: Option<(SharedString, String)>,
     editors: Editors,
+    /// The preferences last painted onto the theme and window.
+    applied: Option<Preferences>,
     _pump: Task<()>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Workspace {
@@ -151,9 +173,37 @@ impl Workspace {
                     .placeholder(placeholder)
             })
         };
+        let per_provider = |placeholder: &'static str,
+                            masked: bool,
+                            window: &mut Window,
+                            cx: &mut Context<Self>| {
+            Provider::ALL
+                .iter()
+                .map(|&provider| {
+                    let state = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .masked(masked)
+                            .placeholder(placeholder)
+                    });
+                    (provider, state)
+                })
+                .collect::<Vec<_>>()
+        };
         let editors = Editors {
-            new_project: input("Project name", window, cx),
-            new_project_folder: input("Existing folder (optional)", window, cx),
+            memory: area(5, "Things every session should know about you", window, cx),
+            mcp: area(
+                8,
+                r#"[{"name": "files", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]}]"#,
+                window,
+                cx,
+            ),
+            keys: per_provider("API key", true, window, cx),
+            binaries: per_provider("Found on PATH", false, window, cx),
+            args: per_provider("--add-dir ../shared", false, window, cx),
+            env_key: input("NAME", window, cx),
+            env_value: input("value", window, cx),
+            task_prompt: area(3, "What should the task do?", window, cx),
+            task_every: input("Every N minutes (blank runs once)", window, cx),
             project_name: input("Project name", window, cx),
             instructions: area(
                 10,
@@ -161,27 +211,50 @@ impl Workspace {
                 window,
                 cx,
             ),
-            memory: area(8, "Things every session should know about you", window, cx),
-            mcp: area(
-                8,
-                r#"[{"name": "files", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]}]"#,
+            search: input("Search", window, cx),
+            rename: input("Title", window, cx),
+            path: input("~/", window, cx),
+            new_project: input("Project name", window, cx),
+        };
+        let _subscriptions = vec![
+            cx.subscribe(&editors.search, |_, _, event: &InputEvent, cx| {
+                if let InputEvent::Change = event {
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&editors.rename, window, |this, _, event, _, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.commit_rename(cx);
+                }
+            }),
+            cx.subscribe_in(&editors.path, window, |this, state, event, _, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    let path = state.read(cx).value().to_string();
+                    this.request(Request::ListDir { path });
+                }
+            }),
+        ];
+
+        let code_draft = cx.new(|cx| {
+            ThreadView::draft(
+                false,
+                Provider::Claude,
+                TurnSettings::default(),
+                requests.clone(),
                 window,
                 cx,
-            ),
-            keys: Provider::ALL
-                .iter()
-                .map(|&provider| {
-                    let key = cx.new(|cx| {
-                        InputState::new(window, cx)
-                            .masked(true)
-                            .placeholder("API key")
-                    });
-                    (provider, key)
-                })
-                .collect(),
-            task_prompt: area(4, "What should the task do?", window, cx),
-            task_every: input("Repeat every N minutes (blank runs once)", window, cx),
-        };
+            )
+        });
+        let chat_draft = cx.new(|cx| {
+            ThreadView::draft(
+                true,
+                Provider::Claude,
+                TurnSettings::default(),
+                requests.clone(),
+                window,
+                cx,
+            )
+        });
 
         Self {
             requests,
@@ -191,15 +264,29 @@ impl Workspace {
             auth: Vec::new(),
             settings: SettingsView::default(),
             catalog: HashMap::new(),
+            commands: HashMap::new(),
+            chat: false,
+            started: false,
             view: View::Home,
             thread: None,
-            provider: Provider::Claude,
+            code_draft,
+            chat_draft,
+            project_filter: None,
+            filter_open: false,
+            palette: None,
+            dir: (String::new(), Vec::new()),
+            provider_page: Provider::Claude,
             task_project: None,
-            adding_project: false,
+            task_provider: Provider::Claude,
+            usage: None,
+            usage_days: 7,
+            renaming: None,
             notices: VecDeque::new(),
             update: None,
             editors,
+            applied: None,
             _pump,
+            _subscriptions,
         }
     }
 
@@ -239,6 +326,18 @@ impl Workspace {
         self.notices.push_back((message.into(), error));
     }
 
+    fn prefs(&self) -> &Preferences {
+        &self.settings.prefs
+    }
+
+    fn set_prefs(&mut self, edit: impl FnOnce(&mut Preferences), cx: &mut Context<Self>) {
+        let mut prefs = self.settings.prefs.clone();
+        edit(&mut prefs);
+        self.settings.prefs = prefs.clone();
+        self.request(Request::SetPreferences(prefs));
+        cx.notify();
+    }
+
     fn apply(&mut self, update: Update, window: &mut Window, cx: &mut Context<Self>) {
         let current = match self.view {
             View::Thread(id) => Some(id),
@@ -260,29 +359,41 @@ impl Workspace {
                 self.auth = auth;
                 let servers =
                     serde_json::to_string_pretty(&settings.mcp_servers).unwrap_or_default();
-                self.settings = settings;
                 self.editors
                     .memory
                     .update(cx, |e, cx| e.set_value(memory, window, cx));
                 self.editors
                     .mcp
                     .update(cx, |e, cx| e.set_value(servers, window, cx));
-                self.sync_thread(cx);
+                self.load_provider_editors(&settings, window, cx);
+                self.settings = settings;
+                self.start(window, cx);
+                self.apply_prefs(window, cx);
+                self.sync_views(cx);
             }
-            Update::Projects(projects) => self.projects = projects,
+            Update::Projects(projects) => {
+                self.projects = projects;
+                self.sync_views(cx);
+            }
             Update::Threads(threads) => {
                 self.threads = threads;
-                self.sync_thread(cx);
+                self.sync_views(cx);
             }
             Update::Tasks(tasks) => self.tasks = tasks,
             Update::Auth(auth) => self.auth = auth,
             Update::Settings(settings) => {
+                self.load_provider_editors(&settings, window, cx);
                 self.settings = settings;
-                self.sync_thread(cx);
+                self.apply_prefs(window, cx);
+                self.sync_views(cx);
             }
             Update::Models { provider, models } => {
                 self.catalog.insert(provider, models);
-                self.sync_thread(cx);
+                self.sync_views(cx);
+            }
+            Update::Commands { provider, names } => {
+                self.commands.insert(provider, names);
+                self.sync_views(cx);
             }
             Update::Memory(_) => {}
             Update::Page {
@@ -334,23 +445,147 @@ impl Workspace {
                     view.update(cx, |view, cx| view.show_diff(turn, text, cx));
                 }
             }
+            Update::Usage { rows, daily } => self.usage = Some((rows, daily)),
+            Update::Dir { path, dirs } => {
+                self.editors
+                    .path
+                    .update(cx, |e, cx| e.set_value(path.clone(), window, cx));
+                self.dir = (path, dirs);
+            }
             Update::Notice { message, error } => self.notice(message, error),
             Update::OpenUrl { url } => cx.open_url(&url),
             Update::UpdateAvailable { version, url } => {
-                self.update = Some((format!("Sorrel {version} is available.").into(), url));
+                if self.prefs().check_updates {
+                    self.update = Some((format!("Sorrel {version} is available").into(), url));
+                }
             }
         }
     }
 
-    /// Hands the open thread its info, the model catalog and favorites.
-    fn sync_thread(&mut self, cx: &mut Context<Self>) {
+    /// The first snapshot decides which side opens and what drafts start with.
+    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        let prefs = self.prefs().clone();
+        // Model names for the chips; Claude's list is static, so this is cheap.
+        self.request(Request::ListModels {
+            provider: Provider::Claude,
+        });
+        if prefs.provider != Provider::Claude {
+            self.request(Request::ListModels {
+                provider: prefs.provider,
+            });
+        }
+        self.chat = match prefs.open_in {
+            OpenIn::Chat => true,
+            OpenIn::Code => false,
+            OpenIn::Last => prefs.last_chat,
+        };
+        for draft in [self.code_draft.clone(), self.chat_draft.clone()] {
+            draft.update(cx, |view, cx| {
+                view.reset_draft(prefs.provider, prefs.settings.clone(), window, cx)
+            });
+        }
+    }
+
+    /// Paints theme, accent and glass when they change.
+    fn apply_prefs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prefs = self.prefs().clone();
+        if self.applied.as_ref() == Some(&prefs) {
+            return;
+        }
+        let mode = match prefs.theme {
+            proto::Theme::Light => ThemeMode::Light,
+            proto::Theme::Dark => ThemeMode::Dark,
+            proto::Theme::System => window.appearance().into(),
+        };
+        Theme::change(mode, Some(window), cx);
+        style::apply_accent(&prefs.accent, cx);
+        window.set_background_appearance(if prefs.glass {
+            WindowBackgroundAppearance::Blurred
+        } else {
+            WindowBackgroundAppearance::Opaque
+        });
+        self.applied = Some(prefs);
+    }
+
+    fn load_provider_editors(
+        &mut self,
+        settings: &SettingsView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for (provider, config) in &settings.providers {
+            let changed = self
+                .settings
+                .providers
+                .iter()
+                .find(|(p, _)| p == provider)
+                .is_none_or(|(_, old)| old != config);
+            if !changed {
+                continue;
+            }
+            for (list, value) in [
+                (&self.editors.binaries, config.binary.clone()),
+                (&self.editors.args, config.args.clone()),
+            ] {
+                if let Some((_, state)) = list.iter().find(|(p, _)| p == provider) {
+                    state.update(cx, |e, cx| e.set_value(value, window, cx));
+                }
+            }
+        }
+    }
+
+    fn look(&self) -> Look {
+        let prefs = self.prefs();
+        Look {
+            wallpaper: !prefs.wallpaper.is_empty(),
+            projects: self
+                .projects
+                .iter()
+                .map(|p| (p.id, p.name.clone()))
+                .collect(),
+            enter_steers: prefs.enter_steers,
+            enabled: self
+                .settings
+                .providers
+                .iter()
+                .filter(|(_, c)| !c.disabled)
+                .map(|(p, _)| *p)
+                .collect(),
+        }
+    }
+
+    /// Hands every conversation view its info, catalog and surroundings.
+    fn sync_views(&mut self, cx: &mut Context<Self>) {
+        let look = self.look();
+        let (catalog, favorites, commands) = (
+            self.catalog.clone(),
+            self.settings.favorites.clone(),
+            self.commands.clone(),
+        );
         if let Some(view) = &self.thread {
             let id = view.read(cx).id;
             let info = self.threads.iter().find(|t| t.id == id).cloned();
-            let (catalog, favorites) = (self.catalog.clone(), self.settings.favorites.clone());
+            view.update(cx, |view, cx| view.set_info(info, cx));
+        }
+        let views = [
+            Some(self.code_draft.clone()),
+            Some(self.chat_draft.clone()),
+            self.thread.clone(),
+        ];
+        for view in views.into_iter().flatten() {
+            let (catalog, favorites, commands, look) = (
+                catalog.clone(),
+                favorites.clone(),
+                commands.clone(),
+                look.clone(),
+            );
             view.update(cx, |view, cx| {
-                view.set_info(info, cx);
-                view.set_catalog(catalog, favorites, cx);
+                view.set_catalog(catalog, favorites, commands, cx);
+                view.set_look(look, cx);
             });
         }
     }
@@ -364,13 +599,17 @@ impl Workspace {
             let info = self.threads.iter().find(|t| t.id == id).cloned();
             let requests = self.requests.clone();
             self.thread = Some(cx.new(|cx| ThreadView::new(id, info, requests, window, cx)));
-            self.sync_thread(cx);
+            self.sync_views(cx);
+        }
+        if let Some(info) = self.threads.iter().find(|t| t.id == id) {
+            self.chat = info.chat;
         }
         self.view = View::Thread(id);
         cx.notify();
     }
 
     fn open_thread(&mut self, id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+        self.renaming = None;
         self.show_thread(id, window, cx);
         self.request(Request::OpenThread { id });
     }
@@ -388,756 +627,433 @@ impl Workspace {
         cx.notify();
     }
 
-    fn new_thread(&self, project: Option<ProjectId>) {
-        self.request(Request::CreateThread {
-            project,
-            provider: self.provider,
-        });
+    /// The new-thread screen, optionally in a project.
+    fn new_thread(&mut self, project: Option<ProjectId>, cx: &mut Context<Self>) {
+        self.view = View::Home;
+        if !self.chat {
+            self.code_draft
+                .update(cx, |view, cx| view.set_project(project, cx));
+        }
+        cx.notify();
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let theme = cx.theme();
-        let (border, muted, sidebar) = (theme.border, theme.muted_foreground, theme.sidebar);
-        let now = now();
-        let thread_row = |thread: &ThreadInfo| {
-            let id = thread.id;
-            let status = if thread.needs_input {
-                "Approval".to_owned()
-            } else if thread.running {
-                "Working".to_owned()
-            } else {
-                ago(now - thread.updated_at)
-            };
-            let selected = self.view == View::Thread(id);
-            h_flex()
-                .id(("thread", id as u64))
-                .gap_2()
-                .pl_6()
-                .pr_2()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .when(selected, |el| el.bg(border))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .truncate()
-                        .child(thread.title.clone()),
-                )
-                .child(div().text_xs().text_color(muted).child(status))
-                .on_click(cx.listener(move |this, _, window, cx| this.open_thread(id, window, cx)))
-        };
-        let group = |label: String, project: Option<ProjectId>, key: usize| {
-            h_flex()
-                .gap_1()
-                .pl_2()
-                .pr_1()
-                .pt_2()
-                .child(
-                    div()
-                        .id(("group", key))
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .text_color(muted)
-                        .truncate()
-                        .cursor_pointer()
-                        .child(label)
-                        .when_some(project, |el, id| {
-                            el.on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_project(id, window, cx)
-                            }))
-                        }),
-                )
-                .child(
-                    Button::new(("group-new", key))
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Plus)
-                        .on_click(cx.listener(move |this, _, _, _| this.new_thread(project))),
-                )
-        };
+    fn switch_side(&mut self, chat: bool, cx: &mut Context<Self>) {
+        if self.chat == chat {
+            return;
+        }
+        self.chat = chat;
+        self.view = View::Home;
+        self.set_prefs(|prefs| prefs.last_chat = chat, cx);
+    }
 
-        let mut list = v_flex()
-            .id("sidebar-list")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .gap_0p5();
-        for (ix, project) in self.projects.iter().enumerate() {
-            list = list.child(group(project.name.clone(), Some(project.id), ix + 1));
-            for thread in self
-                .threads
-                .iter()
-                .filter(|t| t.project == Some(project.id))
-            {
-                list = list.child(thread_row(thread));
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.renaming.take() {
+            let title = self.editors.rename.read(cx).value().trim().to_string();
+            if !title.is_empty() {
+                self.request(Request::RenameThread { id, title });
             }
+            cx.notify();
         }
-        list = list.child(group("Chats".into(), None, 0));
-        for thread in self.threads.iter().filter(|t| t.project.is_none()) {
-            list = list.child(thread_row(thread));
-        }
-        if self.adding_project {
-            list = list.child(
-                v_flex()
-                    .gap_1()
-                    .p_2()
-                    .child(Input::new(&self.editors.new_project).small())
-                    .child(Input::new(&self.editors.new_project_folder).small())
-                    .child(
-                        Button::new("create-project")
-                            .primary()
-                            .xsmall()
-                            .label("Create project")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let name = this.editors.new_project.read(cx).value().to_string();
-                                let folder = this
-                                    .editors
-                                    .new_project_folder
-                                    .read(cx)
-                                    .value()
-                                    .trim()
-                                    .to_string();
-                                this.request(Request::CreateProject {
-                                    name,
-                                    folder: (!folder.is_empty()).then(|| folder.into()),
-                                });
-                                this.editors
-                                    .new_project
-                                    .update(cx, |e, cx| e.set_value("", window, cx));
-                                this.editors
-                                    .new_project_folder
-                                    .update(cx, |e, cx| e.set_value("", window, cx));
-                                this.adding_project = false;
-                                cx.notify();
-                            })),
-                    ),
-            );
-        }
-
-        let in_settings = matches!(self.view, View::Settings(_));
-        v_flex()
-            .w(px(272.))
-            .h_full()
-            .flex_shrink_0()
-            .gap_1()
-            .p_2()
-            .bg(sidebar)
-            .border_r_1()
-            .border_color(border)
-            .child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .child(
-                        div()
-                            .flex_1()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Sorrel"),
-                    )
-                    .child(
-                        Button::new("new-thread")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Plus)
-                            .label("New thread")
-                            .on_click(cx.listener(|this, _, _, _| this.new_thread(None))),
-                    ),
-            )
-            .child(list)
-            .child(
-                Button::new("add-project")
-                    .ghost()
-                    .small()
-                    .w_full()
-                    .icon(IconName::Folder)
-                    .label("Add project")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.adding_project = !this.adding_project;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new("settings")
-                    .ghost()
-                    .small()
-                    .w_full()
-                    .icon(IconName::Settings)
-                    .label("Settings")
-                    .selected(in_settings)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.view = View::Settings(Section::General);
-                        this.request(Request::CheckAuth);
-                        cx.notify();
-                    })),
-            )
     }
 
-    fn render_home(&self, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
-        v_flex()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .gap_3()
-            .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child("What should we work on?"))
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(muted)
-                    .child("Threads run the official CLIs you already sign in to. Pick the model inside the thread."),
-            )
-            .child(
-                Button::new("home-new-thread")
-                    .primary()
-                    .icon(IconName::Plus)
-                    .label("New thread")
-                    .on_click(cx.listener(|this, _, _, _| this.new_thread(None))),
-            )
-            .into_any_element()
+    fn open_palette(&mut self, cx: &mut Context<Self>) {
+        self.palette = Some(Palette::Sources);
+        cx.notify();
     }
 
-    fn render_project(&self, id: ProjectId, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
-        let Some(project) = self.projects.iter().find(|p| p.id == id) else {
-            return div()
-                .p_6()
-                .child("This project was removed.")
-                .into_any_element();
-        };
-        let folder = project.folder.clone();
-        page("Project")
-            .child(Input::new(&self.editors.project_name))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(format!("Folder: {}", project.folder.display())),
-            )
-            .child(field_label(
-                "Instructions",
-                "Written to CLAUDE.md and AGENTS.md in the folder.",
-                muted,
-            ))
-            .child(Textarea::new(&self.editors.instructions))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("save-project")
-                            .primary()
-                            .small()
-                            .label("Save")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let name = this.editors.project_name.read(cx).value().to_string();
-                                let instructions =
-                                    this.editors.instructions.read(cx).value().to_string();
-                                this.request(Request::UpdateProject {
-                                    id,
-                                    name,
-                                    instructions,
-                                });
-                            })),
-                    )
-                    .child(
-                        Button::new("project-thread")
-                            .small()
-                            .icon(IconName::Plus)
-                            .label("New thread")
-                            .on_click(cx.listener(move |this, _, _, _| this.new_thread(Some(id)))),
-                    )
-                    .child(
-                        Button::new("project-folder")
-                            .ghost()
-                            .small()
-                            .icon(IconName::FolderOpen)
-                            .label("Open folder")
-                            .on_click(move |_, _, cx| cx.open_url(&thread::file_url(&folder))),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("delete-project")
-                            .danger()
-                            .small()
-                            .label("Remove project")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.request(Request::DeleteProject { id });
-                                this.view = View::Home;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .into_any_element()
+    /// Adds `folder` as a project and closes the dialog.
+    fn add_project(&mut self, folder: std::path::PathBuf, cx: &mut Context<Self>) {
+        let name = folder
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Project".into());
+        self.request(Request::CreateProject {
+            name,
+            folder: Some(folder),
+        });
+        self.palette = None;
+        cx.notify();
     }
 
-    fn render_settings(&self, section: Section, cx: &mut Context<Self>) -> AnyElement {
+    /// Asks the OS for a folder, then adds it.
+    fn pick_folder(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add project".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(mut paths))) = paths.await
+                && let Some(folder) = paths.pop()
+            {
+                let _ = this.update(cx, |this, cx| this.add_project(folder, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Asks the OS for an image, then makes it the wallpaper.
+    fn pick_wallpaper(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose a wallpaper".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(mut paths))) = paths.await
+                && let Some(file) = paths.pop()
+            {
+                let _ = this.update(cx, |this, cx| {
+                    this.set_prefs(
+                        |prefs| prefs.wallpaper = file.to_string_lossy().into_owned(),
+                        cx,
+                    )
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let border = theme.border;
-        let nav = v_flex()
-            .w(px(200.))
-            .flex_shrink_0()
-            .gap_0p5()
-            .p_3()
-            .border_r_1()
-            .border_color(border)
-            .children(Section::ALL.iter().enumerate().map(|(ix, &item)| {
-                Button::new(("section", ix))
-                    .ghost()
-                    .small()
-                    .w_full()
-                    .label(item.label())
-                    .selected(item == section)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.view = View::Settings(item);
-                        cx.notify();
-                    }))
-            }));
-        let content = match section {
-            Section::General => self.render_general(cx),
-            Section::Providers => self.render_providers(cx),
-            Section::Connectors => self.render_connectors(cx),
-            Section::Tasks => self.render_tasks(cx),
-            Section::About => self.render_about(cx),
-        };
-        h_flex()
-            .size_full()
-            .items_start()
-            .child(nav)
-            .child(div().flex_1().min_w_0().h_full().child(content))
-            .into_any_element()
-    }
-
-    fn render_general(&self, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
-        let max = self.settings.max_sessions;
-        page("General")
-            .child(field_label(
-                "Memory",
-                "Shared with every session through CLAUDE.md and AGENTS.md.",
-                muted,
-            ))
-            .child(Textarea::new(&self.editors.memory))
-            .child(
-                h_flex().child(
-                    Button::new("save-memory")
-                        .small()
-                        .label("Save memory")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let text = this.editors.memory.read(cx).value().to_string();
-                            this.request(Request::SetMemory { text });
-                        })),
-                ),
-            )
-            .child(field_label(
-                "Sessions at once",
-                "Turns beyond this wait for a free slot.",
-                muted,
-            ))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Button::new("sessions-down")
-                            .small()
-                            .icon(IconName::Minus)
-                            .on_click(cx.listener(move |this, _, _, _| {
-                                this.request(Request::SetMaxSessions {
-                                    count: max.saturating_sub(1),
-                                })
-                            })),
-                    )
-                    .child(div().text_sm().child(max.to_string()))
-                    .child(
-                        Button::new("sessions-up")
-                            .small()
-                            .icon(IconName::Plus)
-                            .on_click(cx.listener(move |this, _, _, _| {
-                                this.request(Request::SetMaxSessions { count: max + 1 })
-                            })),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_providers(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
-        let (border, muted, danger) = (theme.border, theme.muted_foreground, theme.danger);
-        let cards = Provider::ALL.iter().enumerate().map(|(ix, &provider)| {
-            let (state, detail) = self
-                .auth
-                .iter()
-                .find(|a| a.provider == provider)
-                .map(|s| (s.state, s.detail.clone()))
-                .unwrap_or((AuthState::Unknown, String::new()));
-            let state_label = match state {
-                AuthState::Unknown => "Unknown",
-                AuthState::Missing => "Not installed",
-                AuthState::SignedOut => "Signed out",
-                AuthState::Subscription => "Signed in",
-                AuthState::ApiKey => "API key",
-            };
-            let key = self
-                .editors
-                .keys
-                .iter()
-                .find(|(p, _)| *p == provider)
-                .map(|(_, k)| k.clone());
-            let key_set = self.settings.api_key_set.contains(&provider);
-            let using_key = self.settings.use_api_key.contains(&provider);
-            v_flex()
-                .gap_2()
-                .p_3()
-                .rounded_xl()
-                .border_1()
-                .border_color(border)
+        let (muted, primary, warning) = (theme.muted_foreground, theme.primary, theme.warning);
+        let crumb = |parent: Option<String>, title: String| {
+            h_flex()
+                .gap_1p5()
+                .text_sm()
+                .when_some(parent, |el, parent| {
+                    el.child(div().text_color(muted).child(parent))
+                        .child(div().text_color(muted.opacity(0.6)).child("/"))
+                })
                 .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            div()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(provider.label()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(
-                                    if matches!(state, AuthState::Missing | AuthState::SignedOut) {
-                                        danger
-                                    } else {
-                                        muted
-                                    },
-                                )
-                                .child(state_label),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_xs()
-                                .text_color(muted)
-                                .truncate()
-                                .child(detail),
-                        )
-                        .child(
-                            Button::new(("sign-in", ix))
-                                .xsmall()
-                                .label("Sign in")
-                                .on_click(cx.listener(move |this, _, _, _| {
-                                    this.request(Request::SignIn { provider })
-                                })),
-                        ),
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .truncate()
+                        .child(title),
                 )
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .children(key.map(|key| div().flex_1().child(Input::new(&key).small())))
-                        .child(
-                            Button::new(("save-key", ix))
+        };
+        let project_name = |id: Option<ProjectId>| {
+            id.and_then(|id| self.projects.iter().find(|p| p.id == id))
+                .map(|p| p.name.clone())
+        };
+        let (left, status, actions) = match self.view {
+            View::Thread(id) => {
+                let info = self.threads.iter().find(|t| t.id == id);
+                let title = info.map(|i| i.title.clone()).unwrap_or_default();
+                let parent = info.and_then(|i| project_name(i.project));
+                let status = info.and_then(|i| {
+                    if i.needs_input {
+                        Some(("Needs approval", warning))
+                    } else if i.running {
+                        Some(("Working", primary))
+                    } else {
+                        None
+                    }
+                });
+                let folder = info
+                    .filter(|i| i.project.is_some())
+                    .map(|i| i.folder.clone());
+                let pane_open = self.thread.as_ref().is_some_and(|t| t.read(cx).pane_open());
+                let actions = h_flex()
+                    .gap_1()
+                    .when_some(folder, |el, folder| {
+                        el.child(
+                            Button::new("open-folder")
+                                .ghost()
                                 .xsmall()
-                                .label("Save key")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    if let Some((_, key)) = this
-                                        .editors
-                                        .keys
-                                        .iter()
-                                        .find(|(p, _)| *p == provider)
-                                        .cloned()
-                                    {
-                                        let value = key.read(cx).value().to_string();
-                                        key.update(cx, |e, cx| e.set_value("", window, cx));
-                                        this.request(Request::SetApiKey {
-                                            provider,
-                                            key: Some(value),
-                                        });
+                                .icon(IconName::FolderOpen)
+                                .label("Open folder")
+                                .on_click(move |_, _, cx| cx.open_url(&thread::file_url(&folder))),
+                        )
+                    })
+                    .when(!self.chat, |el| {
+                        el.child(
+                            Button::new("toggle-pane")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::PanelRight)
+                                .selected(pane_open)
+                                .tooltip("Files and changes")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(view) = &this.thread {
+                                        view.update(cx, |view, cx| view.toggle_pane(cx));
                                     }
                                 })),
                         )
-                        .when(key_set, |el| {
-                            el.child(
-                                Button::new(("use-key", ix))
-                                    .ghost()
-                                    .xsmall()
-                                    .label("Use API key")
-                                    .selected(using_key)
-                                    .on_click(cx.listener(move |this, _, _, _| {
-                                        this.request(Request::SetUseApiKey {
-                                            provider,
-                                            on: !using_key,
-                                        })
-                                    })),
-                            )
-                            .child(
-                                Button::new(("remove-key", ix))
-                                    .ghost()
-                                    .xsmall()
-                                    .label("Remove key")
-                                    .on_click(cx.listener(move |this, _, _, _| {
-                                        this.request(Request::SetApiKey {
-                                            provider,
-                                            key: None,
-                                        })
-                                    })),
-                            )
-                        }),
-                )
-        });
-        page("Providers")
-            .child(div().text_sm().text_color(muted).child(
-                "Sign-in happens inside each official CLI; Sorrel never sees those tokens. API keys you enter here stay on this machine.",
-            ))
-            .child(h_flex().child(Button::new("check-auth").xsmall().icon(IconName::RefreshCw).label("Check again").on_click(
-                cx.listener(|this, _, _, _| this.request(Request::CheckAuth)),
-            )))
-            .children(cards)
-            .into_any_element()
-    }
-
-    fn render_connectors(&self, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
-        page("Connectors")
-            .child(field_label(
-                "MCP servers",
-                "A JSON list, passed to every CLI when a session starts.",
-                muted,
-            ))
-            .child(Textarea::new(&self.editors.mcp))
-            .child(
-                h_flex().child(
-                    Button::new("save-mcp")
-                        .small()
-                        .label("Save connectors")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let json = this.editors.mcp.read(cx).value().to_string();
-                            this.request(Request::SetMcpServers { json });
-                        })),
+                    });
+                (crumb(parent, title), status, Some(actions))
+            }
+            View::Home if self.chat => (crumb(None, "New chat".into()), None, None),
+            View::Home => {
+                let parent = project_name(self.code_draft.read(cx).project());
+                (crumb(parent, "New thread".into()), None, None)
+            }
+            View::Project(id) => (
+                crumb(
+                    Some("Project".into()),
+                    project_name(Some(id)).unwrap_or_default(),
                 ),
-            )
-            .into_any_element()
+                None,
+                None,
+            ),
+            View::Settings(_) => (crumb(None, "Settings".into()), None, None),
+            View::Usage => (crumb(None, "Usage".into()), None, None),
+        };
+        let _ = window;
+        TitleBar::new().bg(transparent_black()).border_b_0().child(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_3()
+                .child(
+                    div()
+                        .w(px(SIDEBAR - 24.))
+                        .flex_shrink_0()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Sorrel"),
+                )
+                .child(left)
+                .when_some(status, |el, (label, color)| {
+                    el.child(
+                        h_flex()
+                            .gap_1p5()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_full()
+                            .bg(color.opacity(0.15))
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(color)
+                            .child(div().size(px(6.)).rounded_full().bg(color))
+                            .child(label),
+                    )
+                })
+                .child(div().flex_1())
+                .children(actions)
+                .child(div().w(px(8.))),
+        )
     }
 
-    fn render_tasks(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_palette(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let step = self.palette?;
         let theme = cx.theme();
-        let (border, muted) = (theme.border, theme.muted_foreground);
-        let project_button = |label: String, project: Option<ProjectId>, ix: usize| {
-            Button::new(("task-project", ix))
-                .ghost()
-                .xsmall()
-                .label(label)
-                .selected(self.task_project == project)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.task_project = project;
-                    cx.notify();
-                }))
+        let (fg, muted, popover) = (theme.foreground, theme.muted_foreground, theme.popover);
+        let source = |id: &'static str, icon: IconName, title: &'static str, hint: &'static str| {
+            h_flex()
+                .id(id)
+                .gap_3()
+                .p_2()
+                .rounded_lg()
+                .cursor_pointer()
+                .hover(move |style| style.bg(fg.opacity(0.06)))
+                .child(gpui_kit::component::Icon::new(icon).text_color(muted))
+                .child(
+                    v_flex()
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+                        .child(div().text_xs().text_color(muted).child(hint)),
+                )
         };
-        let provider_button = |provider: Provider| {
-            Button::new(("task-provider", provider as usize))
-                .ghost()
-                .xsmall()
-                .label(provider.label())
-                .selected(self.provider == provider)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.provider = provider;
-                    cx.notify();
-                }))
-        };
-        let now = now();
-        let list = self.tasks.iter().map(|task| {
-            let id = task.id;
-            let schedule = match task.every_minutes {
-                Some(minutes) => format!("every {minutes} min"),
-                None => "once".into(),
-            };
-            let next = if task.next_run < 0 {
-                "done".to_owned()
-            } else if task.next_run <= now {
-                "due now".to_owned()
-            } else {
-                format!("next in {} min", (task.next_run - now + 59) / 60)
-            };
-            let thread = task.thread;
-            v_flex()
+        let body = match step {
+            Palette::Sources => v_flex()
                 .gap_1()
-                .p_3()
-                .rounded_xl()
-                .border_1()
-                .border_color(border)
+                .p_2()
+                .child(
+                    div()
+                        .px_2()
+                        .pt_1()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Add a project from"),
+                )
+                .child(
+                    source(
+                        "src-local",
+                        IconName::FolderOpen,
+                        "Local folder",
+                        "Browse a folder on disk",
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.palette = Some(Palette::Browse);
+                        let path = this.editors.path.read(cx).value().to_string();
+                        this.request(Request::ListDir { path });
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    source(
+                        "src-new",
+                        IconName::Plus,
+                        "New project",
+                        "Start an empty folder in Sorrel's projects folder",
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.palette = Some(Palette::Create);
+                        cx.notify();
+                    })),
+                )
+                .into_any_element(),
+            Palette::Create => v_flex()
+                .gap_3()
+                .p_4()
                 .child(
                     div()
                         .text_sm()
-                        .child(task.prompt.chars().take(200).collect::<String>()),
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("New project"),
                 )
-                .child(div().text_xs().text_color(muted).child(format!(
-                    "{} · {schedule} · {next} · {}",
-                    task.provider.label(),
-                    if task.last_status.is_empty() {
-                        "not run yet"
-                    } else {
-                        task.last_status.as_str()
-                    }
-                )))
+                .child(Input::new(&self.editors.new_project))
                 .child(
-                    h_flex()
-                        .gap_1()
-                        .child(
-                            Button::new(("run-task", id as u64))
-                                .xsmall()
-                                .label("Run now")
-                                .on_click(cx.listener(move |this, _, _, _| {
-                                    this.request(Request::RunTask { id })
-                                })),
-                        )
-                        .when_some(thread, |el, thread| {
-                            el.child(
-                                Button::new(("task-thread", id as u64))
+                    h_flex().gap_2().child(div().flex_1()).child(
+                        Button::new("create-project")
+                            .primary()
+                            .small()
+                            .label("Create")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let name = this.editors.new_project.read(cx).value().to_string();
+                                this.request(Request::CreateProject { name, folder: None });
+                                this.editors
+                                    .new_project
+                                    .update(cx, |e, cx| e.set_value("", window, cx));
+                                this.palette = None;
+                                cx.notify();
+                            })),
+                    ),
+                )
+                .into_any_element(),
+            Palette::Browse => {
+                let base = self.dir.0.clone();
+                let dirs = v_flex()
+                    .id("dir-list")
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .gap_0p5()
+                    .children(self.dir.1.iter().enumerate().map(|(ix, name)| {
+                        let next = format!("{base}{name}{}", std::path::MAIN_SEPARATOR);
+                        h_flex()
+                            .id(("dir", ix))
+                            .gap_2()
+                            .px_2()
+                            .py_1p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(fg.opacity(0.06)))
+                            .child(
+                                gpui_kit::component::Icon::new(IconName::Folder)
+                                    .small()
+                                    .text_color(muted),
+                            )
+                            .child(div().text_sm().child(name.clone()))
+                            .on_click(cx.listener(move |this, _, _, _| {
+                                this.request(Request::ListDir { path: next.clone() })
+                            }))
+                    }));
+                v_flex()
+                    .gap_2()
+                    .p_3()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("browse-back")
                                     .ghost()
                                     .xsmall()
-                                    .label("Open thread")
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_thread(thread, window, cx)
+                                    .icon(IconName::ChevronLeft)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.palette = Some(Palette::Sources);
+                                        cx.notify();
                                     })),
                             )
-                        })
-                        .child(
-                            Button::new(("delete-task", id as u64))
-                                .ghost()
-                                .xsmall()
-                                .label("Delete")
-                                .on_click(cx.listener(move |this, _, _, _| {
-                                    this.request(Request::DeleteTask { id })
-                                })),
-                        ),
-                )
-        });
-        page("Scheduled tasks")
-            .child(div().text_sm().text_color(muted).child(
-                "Prompts that run on their own and post results to a thread. Nobody is there to approve, so anything that needs approval is denied.",
-            ))
-            .child(Textarea::new(&self.editors.task_prompt))
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .child(project_button("No project".into(), None, 0))
-                    .children(self.projects.iter().enumerate().map(|(ix, p)| project_button(p.name.clone(), Some(p.id), ix + 1))),
-            )
-            .child(h_flex().flex_wrap().gap_1().children(Provider::ALL.map(provider_button)))
-            .child(Input::new(&self.editors.task_every).small())
-            .child(h_flex().child(Button::new("create-task").primary().small().label("Create task").on_click(cx.listener(
-                |this, _, window, cx| {
-                    let prompt = this.editors.task_prompt.read(cx).value().to_string();
-                    let every = this.editors.task_every.read(cx).value().trim().parse::<u32>().ok();
-                    this.request(Request::CreateTask {
-                        project: this.task_project,
-                        provider: this.provider,
-                        prompt,
-                        every_minutes: every,
-                    });
-                    this.editors.task_prompt.update(cx, |e, cx| e.set_value("", window, cx));
-                    this.editors.task_every.update(cx, |e, cx| e.set_value("", window, cx));
-                },
-            ))))
-            .children(list)
-            .into_any_element()
-    }
-
-    fn render_about(&self, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
-        page("About")
-            .child(
-                div()
-                    .text_sm()
-                    .child(format!("Sorrel {}", env!("CARGO_PKG_VERSION"))),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(format!("Data folder: {}", self.settings.data_dir.display())),
-            )
-            .into_any_element()
-    }
-}
-
-/// A scrollable settings or project page with a heading.
-fn page(title: &'static str) -> Stateful<Div> {
-    v_flex()
-        .id(title)
-        .size_full()
-        .overflow_y_scroll()
-        .p_6()
-        .gap_3()
-        .max_w(px(760.))
-        .child(
-            div()
-                .text_xl()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(title),
-        )
-}
-
-fn field_label(title: &'static str, hint: &'static str, muted: Hsla) -> Div {
-    v_flex()
-        .pt_2()
-        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
-        .child(div().text_xs().text_color(muted).child(hint))
-}
-
-fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// "now", "5m", "3h", "2d".
-fn ago(seconds: i64) -> String {
-    match seconds.max(0) {
-        s if s < 60 => "now".into(),
-        s if s < 3600 => format!("{}m", s / 60),
-        s if s < 86_400 => format!("{}h", s / 3600),
-        s => format!("{}d", s / 86_400),
-    }
-}
-
-impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sidebar = self.render_sidebar(cx);
-        let main = match self.view {
-            View::Home => self.render_home(cx),
-            View::Thread(_) => match &self.thread {
-                Some(view) => view.clone().into_any_element(),
-                None => self.render_home(cx),
-            },
-            View::Project(id) => self.render_project(id, cx),
-            View::Settings(section) => self.render_settings(section, cx),
+                            .child(div().flex_1().child(Input::new(&self.editors.path).small()))
+                            .child(
+                                Button::new("browse-add")
+                                    .primary()
+                                    .small()
+                                    .label("Add")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let path =
+                                            this.editors.path.read(cx).value().trim().to_string();
+                                        if !path.is_empty() {
+                                            this.add_project(path.into(), cx);
+                                        }
+                                    })),
+                            ),
+                    )
+                    .child(dirs)
+                    .child(
+                        h_flex()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("Enter opens the typed path. Click a folder to go in.")
+                            .child(div().flex_1())
+                            .child(
+                                Button::new("system-picker")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Open system picker")
+                                    .on_click(cx.listener(|this, _, _, cx| this.pick_folder(cx))),
+                            ),
+                    )
+                    .into_any_element()
+            }
         };
+        Some(
+            div()
+                .id("palette-overlay")
+                .absolute()
+                .inset_0()
+                .bg(black().opacity(0.5))
+                .flex()
+                .items_start()
+                .justify_center()
+                .pt(px(90.))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.palette = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id("palette")
+                        .w(px(540.))
+                        .h_auto()
+                        .rounded_xl()
+                        .bg(popover.opacity(0.96))
+                        .border_1()
+                        .border_color(fg.opacity(0.1))
+                        .shadow_lg()
+                        // Clicks inside stay inside.
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(body),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_toasts(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let (background, foreground, border, danger, muted) = (
-            theme.background,
-            theme.foreground,
-            theme.border,
-            theme.danger,
-            theme.muted_foreground,
-        );
+        let (fg, danger, popover) = (theme.foreground, theme.danger, theme.popover);
+        let pill = |content: Div| {
+            content
+                .gap_2()
+                .pl_4()
+                .pr_1()
+                .py_1()
+                .rounded_full()
+                .bg(popover.opacity(0.92))
+                .border_1()
+                .border_color(fg.opacity(0.1))
+                .shadow_lg()
+                .text_sm()
+        };
         let notices = self
             .notices
             .iter()
             .enumerate()
             .map(|(ix, (message, error))| {
-                h_flex()
-                    .gap_2()
-                    .px_4()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(border)
-                    .text_sm()
-                    .text_color(if *error { danger } else { muted })
-                    .child(div().flex_1().child(message.clone()))
+                pill(h_flex())
+                    .when(*error, |el| el.text_color(danger))
+                    .child(div().max_w(px(560.)).child(message.clone()))
                     .child(
                         Button::new(("dismiss", ix))
                             .ghost()
@@ -1150,35 +1066,98 @@ impl Render for Workspace {
                     )
             });
         let update = self.update.clone().map(|(message, url)| {
-            h_flex()
-                .gap_2()
-                .px_4()
-                .py_1()
-                .border_b_1()
-                .border_color(border)
-                .text_sm()
-                .child(div().flex_1().child(message))
+            pill(h_flex())
+                .child(message)
                 .child(
                     Button::new("get-update")
                         .primary()
                         .xsmall()
+                        .rounded_full()
                         .label("Download")
                         .on_click(move |_, _, cx| cx.open_url(&url)),
                 )
+                .child(
+                    Button::new("dismiss-update")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.update = None;
+                            cx.notify();
+                        })),
+                )
         });
-        h_flex()
+        v_flex()
+            .absolute()
+            .bottom_5()
+            .left_0()
+            .right_0()
+            .items_center()
+            .gap_2()
+            .children(update)
+            .children(notices)
+    }
+}
+
+impl Render for Workspace {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let titlebar = self.render_titlebar(window, cx);
+        let in_settings = matches!(self.view, View::Settings(_));
+        let sidebar = if in_settings {
+            self.render_settings_nav(cx).into_any_element()
+        } else {
+            self.render_sidebar(cx).into_any_element()
+        };
+        let main = match self.view {
+            View::Home if self.chat => self.chat_draft.clone().into_any_element(),
+            View::Home => self.code_draft.clone().into_any_element(),
+            View::Thread(_) => match &self.thread {
+                Some(view) => view.clone().into_any_element(),
+                None => self.code_draft.clone().into_any_element(),
+            },
+            View::Project(id) => self.render_project(id, cx),
+            View::Settings(section) => self.render_settings(section, cx),
+            View::Usage => self.render_usage(cx),
+        };
+        let palette = self.render_palette(cx);
+        let toasts = self.render_toasts(cx);
+        let prefs = self.prefs().clone();
+        let theme = cx.theme();
+        let (background, foreground) = (theme.background, theme.foreground);
+        let backdrop = match self.view {
+            View::Home => Backdrop::Hero,
+            View::Thread(_) => Backdrop::Session,
+            _ => Backdrop::Quiet,
+        };
+        let wallpaper = !prefs.wallpaper.is_empty();
+        div()
             .size_full()
-            .bg(background)
+            .relative()
+            .bg(if prefs.glass && !wallpaper {
+                background.opacity(0.8)
+            } else {
+                background
+            })
             .text_color(foreground)
-            .child(sidebar)
+            .when(wallpaper, |el| {
+                el.child(style::wallpaper(
+                    &prefs.wallpaper,
+                    backdrop,
+                    prefs.scanlines,
+                    background,
+                ))
+            })
             .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .children(update)
-                    .children(notices)
-                    .child(div().flex_1().min_h_0().child(main)),
+                v_flex().relative().size_full().child(titlebar).child(
+                    h_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .items_start()
+                        .child(sidebar)
+                        .child(div().flex_1().min_w_0().h_full().child(main)),
+                ),
             )
+            .children(palette)
+            .child(toasts)
     }
 }
