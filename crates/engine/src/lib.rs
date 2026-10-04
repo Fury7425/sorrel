@@ -596,7 +596,7 @@ impl Engine {
             let idle = self
                 .sessions
                 .iter()
-                .filter(|(&id, s)| id != thread && !s.running && !s.waiting && s.queue.is_empty())
+                .filter(|&(&id, s)| id != thread && !s.running && !s.waiting && s.queue.is_empty())
                 .min_by_key(|(_, s)| s.last_used)
                 .map(|(&id, _)| id);
             if let Some(id) = idle {

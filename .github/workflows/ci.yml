@@ -40,6 +40,14 @@ jobs:
       - name: Build perf binary
         run: cargo build --release --locked -p sorrel --features bench
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sorrel-${{ matrix.os }}
+          path: |
+            target/release/sorrel
+            target/release/sorrel.exe
+          if-no-files-found: ignore
+
       # CI runners render in software, so frame numbers here are a regression
       # tripwire, not the figures in docs/PERF.md.
       - name: Perf gate
