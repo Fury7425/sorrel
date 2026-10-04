@@ -1117,7 +1117,9 @@ impl ThreadView {
                         } else {
                             IconName::Star
                         })
-                        .on_click(cx.listener(move |this, _, _, _| {
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // The star sits on the row; don't also pick the model.
+                            cx.stop_propagation();
                             this.request(Request::ToggleFavorite {
                                 provider,
                                 model: model.clone(),
@@ -1153,7 +1155,15 @@ impl ThreadView {
             .p_2()
             .gap_2()
             .child(Input::new(&self.model_search).small())
-            .child(h_flex().flex_1().min_h_0().gap_2().child(rail).child(list))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_start()
+                    .gap_2()
+                    .child(rail)
+                    .child(list),
+            )
             .into_any_element()
     }
 
@@ -1520,6 +1530,8 @@ impl Render for ThreadView {
             .info
             .as_ref()
             .and_then(|info| {
+                // A chat's scratch folder is named after its id; only a project folder means anything.
+                info.project?;
                 info.folder
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -1593,7 +1605,7 @@ impl Render for ThreadView {
                             div()
                                 .text_sm()
                                 .text_color(muted)
-                                .child(format!("in {folder}")),
+                                .when(!folder.is_empty(), |el| el.child(format!("in {folder}"))),
                         ),
                 )
                 .child(composer)

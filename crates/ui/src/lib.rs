@@ -704,6 +704,7 @@ impl Workspace {
         };
         h_flex()
             .size_full()
+            .items_start()
             .child(nav)
             .child(div().flex_1().min_w_0().h_full().child(content))
             .into_any_element()

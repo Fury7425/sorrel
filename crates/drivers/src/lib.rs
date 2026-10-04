@@ -149,7 +149,7 @@ impl StderrTail {
 pub(crate) fn spawn_error(bin: &std::path::Path, e: &std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::NotFound {
         format!(
-            "{} was not found. Install it, or point Sorrel at it in Settings.",
+            "{} was not found. Install it, or set SORREL_<NAME>_BIN to where it lives.",
             bin.display()
         )
     } else {
