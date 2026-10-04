@@ -59,15 +59,16 @@ def main():
     def wait_for(phase):
         nonlocal peak_rss
         while time.monotonic() < deadline:
+            # Read first: the app writes its final report and exits right away.
+            report = read_json(out)
+            if report and report.get("phase") == phase:
+                return report
             if proc.poll() is not None:
                 sys.exit(f"sorrel exited with code {proc.returncode} before phase {phase!r}")
             try:
                 peak_rss = max(peak_rss, app.memory_info().rss)
             except psutil.Error:
                 pass
-            report = read_json(out)
-            if report and report.get("phase") == phase:
-                return report
             time.sleep(0.1)
         proc.kill()
         sys.exit(f"timed out waiting for phase {phase!r}")
