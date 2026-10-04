@@ -82,7 +82,10 @@ def main():
     cpu_after, t_after = app.cpu_times(), time.monotonic()
     idle_rss = app.memory_info().rss
     # Private memory leaves out shared and mapped pages (fonts, GPU driver).
-    idle_private = app.memory_full_info().uss
+    try:
+        idle_private = app.memory_full_info().uss
+    except psutil.AccessDenied:
+        idle_private = -1e6  # macOS runners refuse this; reported as -1
     report = wait_for("done")
     proc.wait(timeout=30)
 
