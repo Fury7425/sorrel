@@ -22,7 +22,10 @@ use std::{
 
 use drivers::claude;
 use gpui_kit::*;
-use proto::{AgentEvent, Provider, Request, SettingsView, ThreadEvent, ThreadInfo, Update};
+use proto::{
+    AgentEvent, AuthState, AuthStatus, McpServer, ProjectInfo, Provider, Request, SettingsView,
+    TaskInfo, ThreadEvent, ThreadInfo, Update,
+};
 use tokio::{
     runtime::Runtime,
     sync::{broadcast::error::RecvError, mpsc},
@@ -92,7 +95,7 @@ fn main() {
                 ..Default::default()
             };
             let first_frame = Rc::new(Cell::new(None::<f64>));
-            let (_, view) = gpui_kit::open_window(options, cx, |window, cx| {
+            let (window, view) = gpui_kit::open_window(options, cx, |window, cx| {
                 let first_frame = first_frame.clone();
                 window.on_next_frame(move |_, _| {
                     let ms = startup_ms(start);
@@ -105,10 +108,10 @@ fn main() {
 
             #[cfg(feature = "bench")]
             if let Some(out) = bench {
-                bench::run(view, out, first_frame, cx);
+                bench::run(window, view, out, first_frame, cx);
             }
             #[cfg(not(feature = "bench"))]
-            let _ = (view, bench, first_frame);
+            let _ = (window, view, bench, first_frame);
         });
     drop(runtime);
 }
@@ -186,12 +189,45 @@ fn replay(
         };
         let opening = [
             Update::Snapshot {
-                projects: Vec::new(),
+                projects: vec![ProjectInfo {
+                    id: 1,
+                    name: "Replay project".into(),
+                    folder: PathBuf::from("replay"),
+                    instructions: "Keep answers short.
+
+Prefer small diffs."
+                        .into(),
+                }],
                 threads: vec![thread],
-                tasks: Vec::new(),
-                auth: Vec::new(),
-                settings: SettingsView::default(),
-                memory: String::new(),
+                tasks: vec![TaskInfo {
+                    id: 1,
+                    project: Some(1),
+                    provider: Provider::Claude,
+                    prompt: "Summarize yesterday's changes".into(),
+                    every_minutes: Some(60),
+                    next_run: 0,
+                    thread: Some(1),
+                    last_status: "finished".into(),
+                }],
+                auth: Provider::ALL
+                    .iter()
+                    .map(|&provider| AuthStatus {
+                        provider,
+                        state: AuthState::Subscription,
+                        detail: "replay".into(),
+                    })
+                    .collect(),
+                settings: SettingsView {
+                    mcp_servers: vec![McpServer {
+                        name: "files".into(),
+                        command: "npx".into(),
+                        ..Default::default()
+                    }],
+                    max_sessions: 4,
+                    data_dir: PathBuf::from("replay"),
+                    ..Default::default()
+                },
+                memory: "I prefer Rust and short answers.".into(),
             },
             Update::Page {
                 thread: 1,

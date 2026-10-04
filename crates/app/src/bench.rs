@@ -12,15 +12,24 @@ use gpui_kit::{
     profiler::{FrameEvent, FrameTimingCollector, set_trace_enabled},
     *,
 };
-use ui::Workspace;
+use ui::{Screen, Workspace};
 
 /// perf.py samples RSS and CPU inside this window.
 const IDLE: Duration = Duration::from_secs(15);
 const SCROLL_ROWS_PER_STEP: usize = 20;
 const SCROLL_STEP: Duration = Duration::from_millis(8);
 const SETTLE: Duration = Duration::from_secs(3);
+const SCREEN_DWELL: Duration = Duration::from_millis(500);
+const SCREENS: [(&str, Screen); 5] = [
+    ("settings", Screen::Settings),
+    ("tasks", Screen::Tasks),
+    ("project", Screen::Project),
+    ("home", Screen::Home),
+    ("thread", Screen::Thread),
+];
 
 pub fn run(
+    window: AnyWindowHandle,
     view: Entity<Workspace>,
     out: PathBuf,
     first_frame: Rc<Cell<Option<f64>>>,
@@ -63,6 +72,22 @@ pub fn run(
         }
         let scroll = Phase::new(collector.collect_unseen());
 
+        // Every screen: switch to it, then let it settle. The first frame
+        // after the switch is the cost of opening that screen.
+        let mut screens = Vec::new();
+        for (name, screen) in SCREENS {
+            collector.collect_unseen();
+            let shown = view.clone();
+            let _ = cx.update_window(window, |_, window, cx| {
+                shown.update(cx, |workspace, cx| workspace.show(screen, window, cx))
+            });
+            cx.background_executor().timer(SCREEN_DWELL).await;
+            screens.push(format!(
+                r#""{name}":{}"#,
+                Phase::new(collector.collect_unseen()).json()
+            ));
+        }
+
         // Let the last transitions (streamed-text fade, scrollbar, jump
         // button) finish; idle starts once nothing is moving.
         cx.background_executor().timer(SETTLE).await;
@@ -75,9 +100,10 @@ pub fn run(
 
         let first_frame_ms = first_frame.get().unwrap_or(-1.);
         let report = format!(
-            r#"{{"phase":"done","first_frame_ms":{first_frame_ms:.1},"rows":{rows},"stream":{},"scroll":{},"idle":{}}}"#,
+            r#"{{"phase":"done","first_frame_ms":{first_frame_ms:.1},"rows":{rows},"stream":{},"scroll":{},"screens":{{{}}},"idle":{}}}"#,
             stream.json(),
             scroll.json(),
+            screens.join(","),
             idle.json(),
         );
         write(&out, &report);

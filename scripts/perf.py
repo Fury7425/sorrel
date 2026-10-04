@@ -26,6 +26,8 @@ BUDGET = {
     "idle_cpu_pct": 1.0,
     "stream_draw_p99_ms": 16.7,
     "scroll_draw_p99_ms": 16.7,
+    "screen_switch_max_ms": 33.3,
+    "screens_draw_p99_ms": 16.7,
 }
 
 
@@ -92,6 +94,9 @@ def main():
         "idle_cpu_pct": 100 * busy / (t_after - t_before),
         "stream_draw_p99_ms": report["stream"]["draw_ms"]["p99"],
         "scroll_draw_p99_ms": report["scroll"]["draw_ms"]["p99"],
+        # Opening a screen may take two frames at 60 Hz; staying on it must fit in one.
+        "screen_switch_max_ms": max(s["draw_ms"]["max"] for s in report["screens"].values()),
+        "screens_draw_p99_ms": max(s["draw_ms"]["p99"] for s in report["screens"].values()),
         "idle_private_mb": idle_private / 1e6,
         "peak_rss_mb": peak_rss / 1e6,
         "idle_frames": report["idle"]["frames"],
@@ -104,6 +109,8 @@ def main():
         over = budget is not None and value > budget
         failed |= over
         print(f"{name:<22}{value:>12.1f}{budget if budget is not None else '-':>10}{'  OVER' if over else ''}")
+    for name, screen in report["screens"].items():
+        print(f"  screen {name:<9} frames {screen['frames']:>3}  draw p50 {screen['draw_ms']['p50']:>6.2f}  max {screen['draw_ms']['max']:>6.2f} ms")
     print(json.dumps(report))
     sys.exit(1 if failed else 0)
 

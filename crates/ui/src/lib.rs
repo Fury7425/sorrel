@@ -22,6 +22,16 @@ use tokio::sync::mpsc;
 
 pub use thread::ThreadView;
 
+/// The screens a perf run visits.
+#[derive(Clone, Copy, Debug)]
+pub enum Screen {
+    Home,
+    Thread,
+    Project,
+    Tasks,
+    Settings,
+}
+
 /// Notices kept on screen; older ones scroll off.
 const MAX_NOTICES: usize = 4;
 
@@ -159,6 +169,26 @@ impl Workspace {
             editors,
             _pump,
         }
+    }
+
+    /// Shows a screen as if its sidebar entry were clicked (perf runs).
+    pub fn show(&mut self, screen: Screen, window: &mut Window, cx: &mut Context<Self>) {
+        match screen {
+            Screen::Home => self.view = View::Home,
+            Screen::Tasks => self.view = View::Tasks,
+            Screen::Settings => self.view = View::Settings,
+            Screen::Project => {
+                if let Some(id) = self.projects.first().map(|p| p.id) {
+                    self.open_project(id, window, cx);
+                }
+            }
+            Screen::Thread => {
+                if let Some(id) = self.thread.as_ref().map(|t| t.read(cx).id) {
+                    self.show_thread(id, window, cx);
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// The open thread's view, for the perf run.
