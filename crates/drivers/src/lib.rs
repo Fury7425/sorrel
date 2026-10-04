@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 
-use proto::{AgentEvent, McpServer, Mode, PermChoice, StopReason};
+use proto::{AgentEvent, McpServer, Mode, PermChoice, StopReason, TurnSettings};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     sync::mpsc,
@@ -72,7 +72,7 @@ pub enum DriverCommand {
     /// `steer` folds the text into the running turn instead of starting one.
     Prompt {
         text: String,
-        mode: Mode,
+        settings: TurnSettings,
         steer: bool,
     },
     Interrupt,

@@ -25,8 +25,8 @@ use std::{
 };
 
 use proto::{
-    AgentEvent, AuthState, McpServer, Mode, PermChoice, Question, StopReason, TodoItem, TodoStatus,
-    ToolKind, ToolStatus,
+    Access, AgentEvent, AuthState, McpServer, Mode, ModelInfo, PermChoice, Question, StopReason,
+    TodoItem, TodoStatus, ToolKind, ToolStatus, TurnSettings,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -185,6 +185,41 @@ impl Server {
         }
     }
 
+    /// The models this Codex offers, from `model/list`.
+    pub async fn models(&self) -> Result<Vec<ModelInfo>, String> {
+        let peer = self.peer().await?;
+        let reply = peer
+            .request(
+                "model/list",
+                json!({ "includeHidden": false }),
+                REQUEST_TIMEOUT,
+            )
+            .await?;
+        Ok(reply["data"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter(|model| model["hidden"] != true)
+            .map(|model| ModelInfo {
+                id: string(&model["model"]),
+                label: model["displayName"]
+                    .as_str()
+                    .or(model["model"].as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                description: string(&model["description"]),
+                efforts: model["supportedReasoningEfforts"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|option| option["reasoningEffort"].as_str().map(str::to_owned))
+                    .collect(),
+            })
+            .collect())
+    }
+
     /// Starts Codex's own ChatGPT sign-in and returns the page to open.
     pub async fn sign_in(&self) -> Result<String, String> {
         let peer = self.peer().await?;
@@ -258,7 +293,7 @@ pub async fn run(
                     }
                 };
                 match command {
-                    DriverCommand::Prompt { text, mode, steer } => {
+                    DriverCommand::Prompt { text, settings, steer } => {
                         if incoming.is_none() {
                             match open(&server, &peer, &cfg, thread.as_deref()).await {
                                 Ok((id, rx, model)) => {
@@ -273,7 +308,7 @@ pub async fn run(
                             }
                         }
                         let id = thread.clone().expect("opened above");
-                        let input = json!([{ "type": "text", "text": format!("{}{text}", mode_prefix(mode)) }]);
+                        let input = json!([{ "type": "text", "text": format!("{}{text}", mode_prefix(settings.mode)) }]);
                         if let (true, Some(turn_id)) = (steer, turn.as_ref()) {
                             let steer = json!({ "threadId": id, "input": input, "expectedTurnId": turn_id });
                             if let Err(e) = peer.request("turn/steer", steer, REQUEST_TIMEOUT).await {
@@ -281,8 +316,14 @@ pub async fn run(
                             }
                             continue;
                         }
-                        let (approval, sandbox) = policy(mode, cfg.unattended);
-                        let start = json!({ "threadId": id, "input": input, "approvalPolicy": approval, "sandboxPolicy": sandbox });
+                        let (approval, sandbox) = policy(&settings, cfg.unattended);
+                        let mut start = json!({ "threadId": id, "input": input, "approvalPolicy": approval, "sandboxPolicy": sandbox });
+                        if let Some(model) = &settings.model {
+                            start["model"] = json!(model);
+                        }
+                        if let Some(effort) = &settings.effort {
+                            start["effort"] = json!(effort);
+                        }
                         match peer.request("turn/start", start, REQUEST_TIMEOUT).await {
                             Ok(started) => {
                                 turn = Some(string(&started["turn"]["id"]));
@@ -415,13 +456,16 @@ async fn open(
 }
 
 /// Approval policy and sandbox for a turn.
-fn policy(mode: Mode, unattended: bool) -> (&'static str, Value) {
+fn policy(settings: &TurnSettings, unattended: bool) -> (&'static str, Value) {
     let write = json!({ "type": "workspaceWrite", "networkAccess": false });
     let read = json!({ "type": "readOnly" });
-    match (unattended, mode) {
-        (true, _) => ("never", write),
-        (false, Mode::Agent) => ("on-request", write),
-        (false, Mode::Plan | Mode::Ask) => ("on-request", read),
+    let full = json!({ "type": "dangerFullAccess" });
+    match (unattended, settings.mode, settings.access) {
+        (true, ..) => ("never", write),
+        (false, Mode::Plan | Mode::Ask, _) => ("on-request", read),
+        // Codex applies edits inside the workspace without asking in this sandbox.
+        (false, Mode::Agent, Access::Supervised | Access::AutoEdits) => ("on-request", write),
+        (false, Mode::Agent, Access::FullAccess) => ("never", full),
     }
 }
 

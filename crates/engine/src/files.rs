@@ -86,6 +86,8 @@ pub struct Settings {
     pub use_api_key: BTreeSet<String>,
     pub mcp_servers: Vec<McpServer>,
     pub max_sessions: usize,
+    /// Starred models as `(provider key, model id)`.
+    pub favorites: Vec<(String, String)>,
 }
 
 impl Settings {
@@ -134,6 +136,13 @@ impl Settings {
             mcp_servers: self.mcp_servers.clone(),
             max_sessions: self.max_sessions,
             data_dir: data_dir.to_owned(),
+            favorites: self
+                .favorites
+                .iter()
+                .filter_map(|(provider, model)| {
+                    Some((Provider::from_key(provider)?, model.clone()))
+                })
+                .collect(),
         }
     }
 }

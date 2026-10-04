@@ -9,7 +9,7 @@ How Sorrel works today. Keep this short and current.
 | `proto` | The typed API: `Request` in, `Update` out, the normalized `AgentEvent`, the `ThreadEvent` log entry, and `Transcript`, the projection that turns a log into rows. |
 | `drivers` | One driver per CLI (`claude`, `codex`, `acp`), the shared JSON-RPC peer (`rpc`) and the blob store. Every driver has the same shape: `run(config, commands, events)`. |
 | `engine` | The actor that owns sessions, supervision, the SQLite index (`store`), checkpoints, settings and instruction files (`files`), tasks, auth checks, and daemon mode (`daemon`). |
-| `ui` | The GPUI window: `Workspace` (sidebar, projects, tasks, settings) and `ThreadView` (transcript, cards, composer, file and diff pane). |
+| `ui` | The GPUI window, laid out like T3 Code. `Workspace`: a sidebar of threads under their projects (status per thread) and a settings page with its own nav (General, Providers, Connectors, Scheduled tasks, About). `ThreadView`: a centered timeline where tool calls and thinking fold into one "Worked" row per stretch, and a composer holding the model picker (search, provider rail, favorites), reasoning effort, Build/Plan, access mode, send/queue/steer/stop, and the approval or question waiting on the user. |
 | `app` | The `sorrel` binary: in-process engine or daemon client, `--daemon`, `--replay` and `--bench` for perf runs, the update check. |
 
 There is no `markdown` crate; see the decision log in `ARCHITECTURE.md`.

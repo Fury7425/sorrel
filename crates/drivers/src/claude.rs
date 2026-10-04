@@ -24,8 +24,8 @@ use std::{
 };
 
 use proto::{
-    AgentEvent, AuthState, McpServer, Mode, MsgId, PermChoice, Question, StopReason, TodoItem,
-    TodoStatus, ToolKind, ToolStatus,
+    Access, AgentEvent, AuthState, McpServer, Mode, ModelInfo, MsgId, PermChoice, Question,
+    StopReason, TodoItem, TodoStatus, ToolKind, ToolStatus, TurnSettings,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -39,6 +39,32 @@ use crate::{DriverCommand, SessionConfig, StderrTail, blob, clip, fail};
 
 /// Tools Ask mode refuses without asking.
 const WRITE_TOOLS: [&str; 4] = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
+
+/// The models the picker offers. The CLI has no list command, so these are
+/// its documented aliases plus a pinned small model.
+pub fn models() -> Vec<ModelInfo> {
+    let efforts: Vec<String> = ["low", "medium", "high", "xhigh", "max"]
+        .map(String::from)
+        .to_vec();
+    [
+        ("fable", "Fable", "Most capable"),
+        ("opus", "Opus", "Deep reasoning for hard work"),
+        ("sonnet", "Sonnet", "Fast and capable"),
+        (
+            "claude-haiku-4-5-20251001",
+            "Haiku 4.5",
+            "Quickest, for small tasks",
+        ),
+    ]
+    .into_iter()
+    .map(|(id, label, description)| ModelInfo {
+        id: id.into(),
+        label: label.into(),
+        description: description.into(),
+        efforts: efforts.clone(),
+    })
+    .collect()
+}
 
 /// Asks `claude auth status`. Never reads credential files.
 pub async fn auth_status(bin: &Path) -> (AuthState, String) {
@@ -95,7 +121,7 @@ pub async fn run(
     let mut translator = Translator::new(cfg.blob_dir.clone());
     let mut batch = Vec::new();
     let mut pending: HashMap<String, Pending> = HashMap::new();
-    let mut mode = Mode::Agent;
+    let mut current = TurnSettings::default();
     let mut in_turn = false;
     let mut interrupting = false;
     let mut started = false;
@@ -107,16 +133,20 @@ pub async fn run(
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 match command {
-                    DriverCommand::Prompt { text, mode: wanted, steer } => {
+                    DriverCommand::Prompt { text, settings: wanted, steer } => {
+                        // The effort is fixed when claude starts: switch it between turns by restarting.
+                        if process.is_some() && !in_turn && wanted.effort != current.effort {
+                            process = None;
+                        }
                         if process.is_none() {
                             if let Err(message) = preflight(&cfg).await {
                                 fail(&events, message, StopReason::Error).await;
                                 continue;
                             }
-                            match Process::spawn(&cfg, session_id.as_deref(), wanted) {
+                            match Process::spawn(&cfg, session_id.as_deref(), &wanted) {
                                 Ok(spawned) => {
                                     process = Some(spawned);
-                                    mode = wanted;
+                                    current = wanted.clone();
                                     started = false;
                                 }
                                 Err(message) => {
@@ -127,12 +157,17 @@ pub async fn run(
                         }
                         let running = process.as_mut().expect("spawned above");
                         let mut written = Ok(());
-                        if permission_mode(wanted) != permission_mode(mode) {
+                        if permission_mode(&wanted) != permission_mode(&current) {
                             next_request += 1;
-                            let request = json!({ "subtype": "set_permission_mode", "mode": permission_mode(wanted) });
+                            let request = json!({ "subtype": "set_permission_mode", "mode": permission_mode(&wanted) });
                             written = running.write(&control_request(next_request, request)).await;
                         }
-                        mode = wanted;
+                        if written.is_ok() && wanted.model != current.model {
+                            next_request += 1;
+                            let request = json!({ "subtype": "set_model", "model": wanted.model });
+                            written = running.write(&control_request(next_request, request)).await;
+                        }
+                        current = TurnSettings { effort: current.effort.clone(), ..wanted };
                         if written.is_ok() {
                             written = running.write(&user_line(&text, steer && in_turn)).await;
                         }
@@ -158,7 +193,7 @@ pub async fn run(
                         if let (Some(running), Some(request)) = (process.as_mut(), pending.remove(&req_id)) {
                             if matches!(request.kind, PendingKind::Plan) && choice != PermChoice::Deny {
                                 // Claude leaves plan mode once its plan is approved.
-                                mode = Mode::Agent;
+                                current.mode = Mode::Agent;
                             }
                             let _ = running.write(&control_response(&req_id, request.response(choice))).await;
                             deadline = Instant::now() + cfg.turn_timeout;
@@ -188,7 +223,7 @@ pub async fn run(
                     continue;
                 };
                 if let Some(request) = translator.translate(&line, &mut batch) {
-                    match decide(&request, mode, cfg.unattended) {
+                    match decide(&request, current.mode, cfg.unattended) {
                         Decision::Reply(response) => {
                             if let Some(running) = process.as_mut() {
                                 let _ = running.write(&control_response(&request.request_id, response)).await;
@@ -624,10 +659,12 @@ fn string(v: &Value) -> String {
     v.as_str().unwrap_or_default().to_owned()
 }
 
-fn permission_mode(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Plan => "plan",
-        Mode::Agent | Mode::Ask => "default",
+fn permission_mode(settings: &TurnSettings) -> &'static str {
+    match (settings.mode, settings.access) {
+        (Mode::Plan, _) => "plan",
+        (_, Access::Supervised) => "default",
+        (_, Access::AutoEdits) => "acceptEdits",
+        (_, Access::FullAccess) => "bypassPermissions",
     }
 }
 
@@ -682,7 +719,11 @@ struct Process {
 }
 
 impl Process {
-    fn spawn(cfg: &SessionConfig, resume: Option<&str>, mode: Mode) -> Result<Self, String> {
+    fn spawn(
+        cfg: &SessionConfig,
+        resume: Option<&str>,
+        settings: &TurnSettings,
+    ) -> Result<Self, String> {
         let mut cmd = crate::command(&cfg.bin);
         cmd.args([
             "--print",
@@ -693,12 +734,23 @@ impl Process {
             "--include-partial-messages",
             "--verbose",
             "--permission-mode",
-            permission_mode(mode),
+            permission_mode(settings),
         ]);
         if cfg.unattended {
             cmd.args(["--permission-prompts", "none"]);
         } else {
-            cmd.args(["--permission-prompt-tool", "stdio"]);
+            // Lets the user switch to Full access later without a restart.
+            cmd.args([
+                "--permission-prompt-tool",
+                "stdio",
+                "--allow-dangerously-skip-permissions",
+            ]);
+        }
+        if let Some(model) = &settings.model {
+            cmd.args(["--model", model]);
+        }
+        if let Some(effort) = &settings.effort {
+            cmd.args(["--effort", effort]);
         }
         if let Some(id) = resume {
             cmd.args(["--resume", id]);

@@ -4,7 +4,7 @@ use drivers::{
     DriverCommand, SessionConfig,
     claude::{Translator, run},
 };
-use proto::{AgentEvent, Mode, StopReason};
+use proto::{AgentEvent, StopReason, TurnSettings};
 use tokio::sync::mpsc;
 
 fn fixtures() -> PathBuf {
@@ -98,7 +98,7 @@ fn fake(
 fn send(text: &str) -> DriverCommand {
     DriverCommand::Prompt {
         text: text.into(),
-        mode: Mode::Agent,
+        settings: TurnSettings::default(),
         steer: false,
     }
 }

@@ -70,6 +70,60 @@ pub enum Mode {
     Ask,
 }
 
+/// How much an agent may do without asking (T3 Code's runtime modes).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Access {
+    /// Ask before commands and file changes.
+    #[default]
+    Supervised,
+    /// Apply edits without asking; ask before anything else.
+    AutoEdits,
+    /// Run commands and edits without prompts.
+    FullAccess,
+}
+
+impl Access {
+    pub const ALL: [Access; 3] = [Access::Supervised, Access::AutoEdits, Access::FullAccess];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Access::Supervised => "Supervised",
+            Access::AutoEdits => "Auto-accept edits",
+            Access::FullAccess => "Full access",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Access::Supervised => "Ask before commands and file changes.",
+            Access::AutoEdits => "Apply edits without asking, ask before other actions.",
+            Access::FullAccess => "Allow commands and edits without prompts.",
+        }
+    }
+}
+
+/// What the composer picked for the next turn. Threads remember theirs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TurnSettings {
+    /// `None` uses the CLI's default model.
+    pub model: Option<String>,
+    /// `None` uses the model's default reasoning effort.
+    pub effort: Option<String>,
+    pub mode: Mode,
+    pub access: Access,
+}
+
+/// One entry in a provider's model list.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    /// Reasoning efforts the model accepts, if the CLI says.
+    pub efforts: Vec<String>,
+}
+
 /// What a message sent during a running turn does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Delivery {
@@ -490,8 +544,12 @@ pub struct ThreadInfo {
     pub provider: Provider,
     pub folder: PathBuf,
     pub running: bool,
+    /// A permission request or question is waiting on the user.
+    pub needs_input: bool,
     pub queued: usize,
     pub updated_at: i64,
+    /// The composer's last choices for this thread.
+    pub settings: TurnSettings,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -544,6 +602,8 @@ pub struct SettingsView {
     pub mcp_servers: Vec<McpServer>,
     pub max_sessions: usize,
     pub data_dir: PathBuf,
+    /// Starred models, as `(provider, model id)`.
+    pub favorites: Vec<(Provider, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -605,8 +665,28 @@ pub enum Request {
     Send {
         thread: ThreadId,
         text: String,
-        mode: Mode,
+        settings: TurnSettings,
         delivery: Delivery,
+    },
+    /// Remembers the composer's choices without sending anything.
+    SetThreadSettings {
+        thread: ThreadId,
+        settings: TurnSettings,
+    },
+    /// Moves a thread that has no messages yet to another CLI.
+    SetThreadProvider {
+        thread: ThreadId,
+        provider: Provider,
+    },
+    ListModels {
+        provider: Provider,
+    },
+    ToggleFavorite {
+        provider: Provider,
+        model: String,
+    },
+    SetMaxSessions {
+        count: usize,
     },
     Interrupt {
         thread: ThreadId,
@@ -729,6 +809,10 @@ pub enum Update {
     },
     OpenUrl {
         url: String,
+    },
+    Models {
+        provider: Provider,
+        models: Vec<ModelInfo>,
     },
     /// A newer release exists; `url` is its download page.
     UpdateAvailable {

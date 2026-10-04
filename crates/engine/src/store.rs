@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use proto::{ProjectId, Provider, Seq, TaskId, TaskInfo, ThreadEvent, ThreadId};
+use proto::{ProjectId, Provider, Seq, TaskId, TaskInfo, ThreadEvent, ThreadId, TurnSettings};
 use rusqlite::{Connection, OptionalExtension, Result, Row, params};
 
 const SCHEMA: &str = "
@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS threads(
     folder TEXT NOT NULL,
     session TEXT,
     turns INTEGER NOT NULL DEFAULT 0,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    settings TEXT
 );
 CREATE TABLE IF NOT EXISTS events(
     id INTEGER PRIMARY KEY,
@@ -73,6 +74,7 @@ pub struct ThreadRow {
     pub session: Option<String>,
     pub turns: u32,
     pub updated_at: i64,
+    pub settings: TurnSettings,
 }
 
 pub fn now() -> i64 {
@@ -102,6 +104,8 @@ impl Store {
 
     fn init(db: Connection) -> Result<Store> {
         db.execute_batch(SCHEMA)?;
+        // Databases from before per-thread settings lack the column; adding it twice is the only failure.
+        let _ = db.execute_batch("ALTER TABLE threads ADD COLUMN settings TEXT");
         Ok(Store { db })
     }
 
@@ -199,6 +203,23 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_settings(&self, id: ThreadId, settings: &TurnSettings) -> Result<()> {
+        let json = serde_json::to_string(settings).expect("settings serialize");
+        self.db.execute(
+            "UPDATE threads SET settings = ?2 WHERE id = ?1",
+            params![id, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_provider(&self, id: ThreadId, provider: Provider) -> Result<()> {
+        self.db.execute(
+            "UPDATE threads SET provider = ?2, session = NULL WHERE id = ?1",
+            params![id, provider.key()],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_thread(&self, id: ThreadId) -> Result<()> {
         self.db
             .execute("DELETE FROM threads WHERE id = ?1", params![id])?;
@@ -216,12 +237,16 @@ impl Store {
             session: r.get(5)?,
             turns: r.get(6)?,
             updated_at: r.get(7)?,
+            settings: r
+                .get::<_, Option<String>>(8)?
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default(),
         })
     }
 
     pub fn threads(&self) -> Result<Vec<ThreadRow>> {
         let mut stmt = self.db.prepare(
-            "SELECT id, project_id, title, provider, folder, session, turns, updated_at
+            "SELECT id, project_id, title, provider, folder, session, turns, updated_at, settings
              FROM threads ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map([], Self::thread_row)?;
@@ -231,7 +256,7 @@ impl Store {
     pub fn thread(&self, id: ThreadId) -> Result<Option<ThreadRow>> {
         self.db
             .query_row(
-                "SELECT id, project_id, title, provider, folder, session, turns, updated_at
+                "SELECT id, project_id, title, provider, folder, session, turns, updated_at, settings
                  FROM threads WHERE id = ?1",
                 params![id],
                 Self::thread_row,

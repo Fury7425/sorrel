@@ -184,8 +184,10 @@ fn replay(
             provider: Provider::Claude,
             folder: PathBuf::new(),
             running: true,
+            needs_input: false,
             queued: 0,
             updated_at: 0,
+            settings: Default::default(),
         };
         let opening = [
             Update::Snapshot {

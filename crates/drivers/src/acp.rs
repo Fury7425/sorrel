@@ -17,8 +17,8 @@
 use std::{collections::HashMap, collections::VecDeque, path::Path, time::Duration};
 
 use proto::{
-    AgentEvent, McpServer, PermChoice, Provider, StopReason, TodoItem, TodoStatus, ToolKind,
-    ToolStatus,
+    Access, AgentEvent, McpServer, PermChoice, Provider, StopReason, TodoItem, TodoStatus,
+    ToolKind, ToolStatus,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -99,6 +99,7 @@ pub async fn run(
     let mut pending: HashMap<String, (Value, Vec<(String, String)>)> = HashMap::new();
     let mut turn = 0u64;
     let mut cancelling = false;
+    let mut access = Access::default();
     let mut batch = Vec::new();
     let mut deadline = Instant::now();
 
@@ -107,8 +108,9 @@ pub async fn run(
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 match command {
-                    DriverCommand::Prompt { text, mode, steer } => {
-                        let text = format!("{}{text}", mode_prefix(mode));
+                    DriverCommand::Prompt { text, settings, steer } => {
+                        access = settings.access;
+                        let text = format!("{}{text}", mode_prefix(settings.mode));
                         if prompt.is_some() {
                             // ACP v1 has no mid-turn input: steering cancels the turn and goes next.
                             if steer {
@@ -182,9 +184,15 @@ pub async fn run(
                             .iter()
                             .map(|o| (string(&o["optionId"]), string(&o["kind"])))
                             .collect();
-                        if cfg.unattended {
+                        // Nobody is watching a task; Full access needs no one to.
+                        let automatic = match (cfg.unattended, access) {
+                            (true, _) => Some(PermChoice::Deny),
+                            (false, Access::FullAccess) => Some(PermChoice::AllowOnce),
+                            _ => None,
+                        };
+                        if let Some(choice) = automatic {
                             if let Some(agent) = &agent {
-                                agent.peer.respond(id, outcome(&options, PermChoice::Deny));
+                                agent.peer.respond(id, outcome(&options, choice));
                             }
                             continue;
                         }

@@ -21,8 +21,8 @@ use std::{
 
 use drivers::{DriverCommand, SessionConfig, acp, blob, claude, codex};
 use proto::{
-    AgentEvent, AuthState, AuthStatus, Delivery, McpServer, Mode, MsgId, ProjectId, ProjectInfo,
-    Provider, Request, Seq, TaskId, ThreadEvent, ThreadId, ThreadInfo, Update,
+    AgentEvent, AuthState, AuthStatus, Delivery, McpServer, MsgId, ProjectId, ProjectInfo,
+    Provider, Request, Seq, TaskId, ThreadEvent, ThreadId, ThreadInfo, TurnSettings, Update,
 };
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc};
@@ -114,7 +114,9 @@ struct Session {
     /// Waiting for a free session slot.
     waiting: bool,
     /// Messages to send after the running turn, in order.
-    queue: VecDeque<(String, Mode)>,
+    queue: VecDeque<(String, TurnSettings)>,
+    /// Permission requests and questions waiting on the user.
+    pending: usize,
     /// Streamed text not yet written to the log: message, thinking?, text.
     buffer: Option<(MsgId, bool, String)>,
     task: Option<TaskId>,
@@ -270,9 +272,54 @@ impl Engine {
             Request::Send {
                 thread,
                 text,
-                mode,
+                settings,
                 delivery,
-            } => self.send_message(thread, text, mode, delivery).await?,
+            } => {
+                db(self.store.set_settings(thread, &settings))?;
+                self.send_message(thread, text, settings, delivery).await?
+            }
+            Request::SetThreadSettings { thread, settings } => {
+                db(self.store.set_settings(thread, &settings))?;
+                self.send(Update::Threads(self.threads()?));
+            }
+            Request::SetThreadProvider { thread, provider } => {
+                let row = db(self.store.thread(thread))?.ok_or("That thread no longer exists.")?;
+                if row.turns > 0 {
+                    return Err("A thread keeps its CLI once it has messages. Start a new thread to switch.".into());
+                }
+                self.sessions.remove(&thread);
+                db(self.store.set_provider(thread, provider))?;
+                db(self.store.set_settings(
+                    thread,
+                    &TurnSettings {
+                        model: None,
+                        effort: None,
+                        ..row.settings
+                    },
+                ))?;
+                self.send(Update::Threads(self.threads()?));
+            }
+            Request::ListModels { provider } => self.list_models(provider),
+            Request::ToggleFavorite { provider, model } => {
+                let entry = (provider.key().to_owned(), model);
+                match self.settings.favorites.iter().position(|f| *f == entry) {
+                    Some(at) => {
+                        self.settings.favorites.remove(at);
+                    }
+                    None => self.settings.favorites.push(entry),
+                }
+                self.settings
+                    .save(&self.dirs.data)
+                    .map_err(|e| e.to_string())?;
+                self.send(Update::Settings(self.settings.view(&self.dirs.data)));
+            }
+            Request::SetMaxSessions { count } => {
+                self.settings.max_sessions = count.clamp(1, 16);
+                self.settings
+                    .save(&self.dirs.data)
+                    .map_err(|e| e.to_string())?;
+                self.send(Update::Settings(self.settings.view(&self.dirs.data)));
+            }
             Request::Interrupt { thread } => {
                 self.waiting.retain(|&waiting| waiting != thread);
                 if let Some(session) = self.sessions.get_mut(&thread) {
@@ -294,6 +341,7 @@ impl Engine {
                         choice,
                     },
                 )?;
+                self.answered(thread)?;
                 self.command(thread, DriverCommand::Resolve { req_id, choice });
             }
             Request::Answer {
@@ -308,6 +356,7 @@ impl Engine {
                         answers: answers.clone(),
                     },
                 )?;
+                self.answered(thread)?;
                 self.command(thread, DriverCommand::Answer { req_id, answers });
             }
             Request::Restore { thread, turn } => self.restore(thread, turn).await?,
@@ -444,7 +493,9 @@ impl Engine {
                     provider: t.provider,
                     folder: t.folder,
                     running: session.is_some_and(|s| s.running || s.waiting),
+                    needs_input: session.is_some_and(|s| s.pending > 0),
                     queued: session.map_or(0, |s| s.queue.len()),
+                    settings: t.settings,
                     updated_at: t.updated_at,
                 }
             })
@@ -498,6 +549,44 @@ impl Engine {
         db(self.store.append(thread, &event))?;
         self.send(Update::Event { thread, event });
         Ok(())
+    }
+
+    /// One waiting card was answered.
+    fn answered(&mut self, thread: ThreadId) -> Result<(), String> {
+        if let Some(session) = self.sessions.get_mut(&thread) {
+            session.pending = session.pending.saturating_sub(1);
+        }
+        self.send(Update::Threads(self.threads()?));
+        Ok(())
+    }
+
+    /// Answers with the provider's models; Codex asks its app-server.
+    fn list_models(&mut self, provider: Provider) {
+        match provider {
+            Provider::Claude => self.send(Update::Models {
+                provider,
+                models: claude::models(),
+            }),
+            Provider::Codex => {
+                let server = self.codex_server();
+                let updates = self.updates.clone();
+                tokio::spawn(async move {
+                    let update = match server.models().await {
+                        Ok(models) => Update::Models { provider, models },
+                        Err(message) => Update::Notice {
+                            message: format!("Could not list Codex models: {message}"),
+                            error: true,
+                        },
+                    };
+                    let _ = updates.send(update);
+                });
+            }
+            // ACP agents pick their own model.
+            _ => self.send(Update::Models {
+                provider,
+                models: Vec::new(),
+            }),
+        }
     }
 
     fn command(&self, thread: ThreadId, command: DriverCommand) {
@@ -585,6 +674,7 @@ impl Engine {
                 running: false,
                 waiting: false,
                 queue: VecDeque::new(),
+                pending: 0,
                 buffer: None,
                 task: None,
                 last_used: Instant::now(),
@@ -610,7 +700,7 @@ impl Engine {
         &mut self,
         thread: ThreadId,
         text: String,
-        mode: Mode,
+        settings: TurnSettings,
         delivery: Delivery,
     ) -> Result<(), String> {
         let text = text.trim().to_owned();
@@ -632,7 +722,7 @@ impl Engine {
         let session = self.sessions.get_mut(&thread).expect("ensured above");
         let (busy, running) = (session.running || session.waiting, session.running);
         if !busy {
-            return self.start_turn(thread, text, mode).await;
+            return self.start_turn(thread, text, settings).await;
         }
         if delivery == Delivery::SteerNow && running {
             self.log(
@@ -646,12 +736,12 @@ impl Engine {
                 thread,
                 DriverCommand::Prompt {
                     text,
-                    mode,
+                    settings,
                     steer: true,
                 },
             );
         } else if let Some(session) = self.sessions.get_mut(&thread) {
-            session.queue.push_back((text, mode));
+            session.queue.push_back((text, settings));
         }
         self.send(Update::Threads(self.threads()?));
         Ok(())
@@ -662,11 +752,11 @@ impl Engine {
         &mut self,
         thread: ThreadId,
         text: String,
-        mode: Mode,
+        settings: TurnSettings,
     ) -> Result<(), String> {
         if self.running >= self.settings.max_sessions {
             if let Some(session) = self.sessions.get_mut(&thread) {
-                session.queue.push_front((text, mode));
+                session.queue.push_front((text, settings));
                 session.waiting = true;
             }
             self.waiting.push_back(thread);
@@ -701,7 +791,7 @@ impl Engine {
             thread,
             DriverCommand::Prompt {
                 text,
-                mode,
+                settings,
                 steer: false,
             },
         );
@@ -735,7 +825,21 @@ impl Engine {
                 if let AgentEvent::SessionStarted { session_id, .. } = &event {
                     let _ = self.store.set_session(thread, session_id);
                 }
+                let asks = matches!(
+                    event,
+                    AgentEvent::PermissionRequest { .. } | AgentEvent::Question { .. }
+                );
                 let ended = matches!(event, AgentEvent::TurnEnded { .. });
+                if let Some(session) = self.sessions.get_mut(&thread) {
+                    if asks {
+                        session.pending += 1;
+                    } else if ended {
+                        session.pending = 0;
+                    }
+                }
+                if asks && let Ok(threads) = self.threads() {
+                    self.send(Update::Threads(threads));
+                }
                 let logged = self.log(thread, ThreadEvent::Agent(event));
                 if ended {
                     self.end_turn(thread).await;
@@ -812,18 +916,20 @@ impl Engine {
 
         // This thread's queue first, then whoever waited longest for a slot.
         let next = match next {
-            Some((text, mode)) => Some((thread, text, mode)),
+            Some((text, settings)) => Some((thread, text, settings)),
             None => self.waiting.pop_front().and_then(|waiting| {
                 let session = self.sessions.get_mut(&waiting)?;
                 session.waiting = false;
                 session
                     .queue
                     .pop_front()
-                    .map(|(text, mode)| (waiting, text, mode))
+                    .map(|(text, settings)| (waiting, text, settings))
             }),
         };
         let started = match next {
-            Some((thread, text, mode)) => Box::pin(self.start_turn(thread, text, mode)).await,
+            Some((thread, text, settings)) => {
+                Box::pin(self.start_turn(thread, text, settings)).await
+            }
             None => self
                 .threads()
                 .map(|threads| self.send(Update::Threads(threads))),
@@ -977,7 +1083,7 @@ impl Engine {
             db(self
                 .store
                 .set_task_run(task.id, next_run, Some(thread), "running"))?;
-            self.start_turn(thread, task.prompt.clone(), Mode::Agent)
+            self.start_turn(thread, task.prompt.clone(), TurnSettings::default())
                 .await?;
         }
         self.send(Update::Tasks(db(self.store.tasks())?));
