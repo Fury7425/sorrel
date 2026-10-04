@@ -24,8 +24,9 @@ use std::{
 };
 
 use proto::{
-    Access, AgentEvent, AuthState, McpServer, Mode, ModelInfo, MsgId, PermChoice, Question,
-    StopReason, TodoItem, TodoStatus, ToolKind, ToolStatus, TurnSettings, ULTRACODE, ULTRATHINK,
+    Access, AgentEvent, AuthState, LimitWindow, McpServer, Mode, ModelInfo, MsgId, PermChoice,
+    Question, StopReason, TodoItem, TodoStatus, ToolKind, ToolStatus, TurnSettings, ULTRACODE,
+    ULTRATHINK, wait_text,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -35,7 +36,16 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 
-use crate::{DriverCommand, SessionConfig, StderrTail, blob, clip, fail};
+use crate::{
+    DriverCommand, SessionConfig, StderrTail, blob, clip, diff_lines, fail, now_secs,
+    unix_from_rfc3339,
+};
+
+/// Context window sizes `claude` runs with: the default, and with `[1m]`.
+const WINDOW: u64 = 200_000;
+const LONG_WINDOW: u64 = 1_000_000;
+/// Lines of a diff or written file shown on a tool call.
+const DETAIL_LINES: usize = 160;
 
 /// Tools Ask mode refuses without asking.
 const WRITE_TOOLS: [&str; 4] = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
@@ -48,8 +58,9 @@ pub fn models() -> Vec<ModelInfo> {
     .map(String::from)
     .to_vec();
     [
-        ("claude-fable-5-1", "Fable 5.1", "Most capable for your hardest tasks"),
+        // The CLI's default first, as `discover_models` leaves it.
         ("claude-opus-5-5", "Opus 5.5", "Best for everyday, complex tasks"),
+        ("claude-fable-5-1", "Fable 5.1", "Most capable for your hardest tasks"),
         ("claude-sonnet-5-5", "Sonnet 5.5", "Efficient for routine tasks"),
         ("claude-haiku-4-5-20251001", "Haiku 4.5", "Fastest for quick answers"),
     ]
@@ -63,6 +74,7 @@ pub fn models() -> Vec<ModelInfo> {
         } else {
             efforts.clone()
         },
+        fast: id.contains("opus"),
     })
     .collect()
 }
@@ -74,6 +86,111 @@ pub async fn discover_models(
     api_key: Option<String>,
     env: Vec<(String, String)>,
 ) -> Result<Vec<ModelInfo>, String> {
+    parse_models(&query(bin, api_key, env, "initialize").await?)
+}
+
+/// A short title for a conversation that opens with `message`, from a
+/// one-shot Haiku call with no tools, settings, hooks or saved session.
+pub async fn title(
+    bin: PathBuf,
+    api_key: Option<String>,
+    env: Vec<(String, String)>,
+    message: &str,
+) -> Result<String, String> {
+    let mut cmd = crate::command(&bin);
+    cmd.args([
+        "--print",
+        "--model",
+        "haiku",
+        "--tools",
+        "",
+        "--setting-sources",
+        "",
+        "--no-session-persistence",
+        "--strict-mcp-config",
+        "--disable-slash-commands",
+        "--system-prompt",
+        "You name chat conversations. Reply with a title of 2 to 6 words in the language of the \
+         user's message: no quotes, no trailing period, nothing else.",
+    ])
+    .envs(env)
+    .current_dir(std::env::temp_dir());
+    if let Some(key) = &api_key {
+        cmd.env("ANTHROPIC_API_KEY", key);
+    }
+    let mut child = cmd.spawn().map_err(|e| crate::spawn_error(&bin, &e))?;
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let prompt = format!("Title this conversation:\n\n{}", clip(message, 2000));
+    stdin
+        .write_all(prompt.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    drop(stdin);
+    let output = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
+        .await
+        .map_err(|_| "claude took too long to title the thread".to_owned())?
+        .map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let title = text
+        .lines()
+        .map(|l| l.trim().trim_matches(['"', '\'', '*', '#', '`']).trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or_default()
+        .trim_end_matches('.');
+    if !output.status.success() || title.is_empty() {
+        return Err("claude gave no title".into());
+    }
+    Ok(title.chars().take(60).collect())
+}
+
+/// The subscription's usage limits, from the `get_usage` control request.
+/// Costs no tokens.
+pub async fn usage_limits(
+    bin: PathBuf,
+    api_key: Option<String>,
+    env: Vec<(String, String)>,
+) -> Result<Vec<LimitWindow>, String> {
+    let response = query(bin, api_key, env, "get_usage").await?;
+    if response["subtype"] == "error" {
+        return Err(string(&response["error"]));
+    }
+    Ok(parse_usage(&response["response"]))
+}
+
+fn parse_usage(usage: &Value) -> Vec<LimitWindow> {
+    let limits = &usage["rate_limits"];
+    if usage["rate_limits_available"] != true || !limits.is_object() {
+        return Vec::new();
+    }
+    LIMIT_KEYS
+        .into_iter()
+        .filter_map(|(key, label)| {
+            let window = &limits[key];
+            Some(LimitWindow {
+                label: label.into(),
+                used: window["utilization"].as_f64()? as f32,
+                resets_at: window["resets_at"].as_str().map_or(0, unix_from_rfc3339),
+            })
+        })
+        .collect()
+}
+
+/// Usage-limit windows by the CLI's name for them, in display order.
+const LIMIT_KEYS: [(&str, &str); 4] = [
+    ("five_hour", "Session"),
+    ("seven_day", "Weekly"),
+    ("seven_day_opus", "Weekly (Opus)"),
+    ("seven_day_sonnet", "Weekly (Sonnet)"),
+];
+
+/// Starts `claude`, sends one control request (after `initialize`, which the
+/// others need) and returns its response. The process dies on return.
+async fn query(
+    bin: PathBuf,
+    api_key: Option<String>,
+    env: Vec<(String, String)>,
+    subtype: &str,
+) -> Result<Value, String> {
     let mut cmd = crate::command(&bin);
     cmd.args([
         "--print",
@@ -93,29 +210,35 @@ pub async fn discover_models(
     let mut child = cmd.spawn().map_err(|e| crate::spawn_error(&bin, &e))?;
     let mut stdin = child.stdin.take().expect("stdin is piped");
     let mut lines = BufReader::new(child.stdout.take().expect("stdout is piped")).lines();
-    let request = json!({
-        "type": "control_request",
-        "request_id": "models",
-        "request": { "subtype": "initialize" },
-    });
-    stdin
-        .write_all(format!("{request}\n").as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut requests = vec!["initialize"];
+    if subtype != "initialize" {
+        requests.push(subtype);
+    }
+    for id in requests {
+        let request = json!({
+            "type": "control_request",
+            "request_id": id,
+            "request": { "subtype": id },
+        });
+        stdin
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     let read = async {
         while let Ok(Some(line)) = lines.next_line().await {
             let Ok(v) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            if v["type"] == "control_response" && v["response"]["request_id"] == "models" {
-                return parse_models(&v["response"]);
+            if v["type"] == "control_response" && v["response"]["request_id"] == subtype {
+                return Ok(v["response"].clone());
             }
         }
-        Err("claude closed before it listed its models".to_owned())
+        Err(format!("claude closed before it answered {subtype}"))
     };
     tokio::time::timeout(Duration::from_secs(30), read)
         .await
-        .map_err(|_| "claude took too long to list its models".to_owned())?
+        .map_err(|_| format!("claude took too long to answer {subtype}"))?
 }
 
 /// The models in an `initialize` response, aliases resolved to concrete ids.
@@ -157,6 +280,7 @@ fn parse_models(response: &Value) -> Result<Vec<ModelInfo>, String> {
             label: entry["displayName"].as_str().unwrap_or(id).into(),
             description: string(&entry["description"]),
             efforts,
+            fast: entry["supportsFastMode"] == true,
         });
     }
     if models.is_empty() {
@@ -261,6 +385,7 @@ pub async fn run(
                             match Process::spawn(&cfg, session_id.as_deref(), &wanted) {
                                 Ok(spawned) => {
                                     process = Some(spawned);
+                                    translator.window = if wanted.long_context { LONG_WINDOW } else { WINDOW };
                                     current = wanted.clone();
                                     started = false;
                                 }
@@ -432,6 +557,12 @@ pub struct ControlRequest {
 pub struct Translator {
     msg_id: MsgId,
     blob_dir: PathBuf,
+    /// The context window's size; each result names the real one.
+    window: u64,
+    /// Context tokens in use after the latest model call.
+    context: u64,
+    /// Usage-limit notices already shown, by window and reset time.
+    announced: Vec<(String, i64)>,
 }
 
 impl Translator {
@@ -439,6 +570,9 @@ impl Translator {
         Self {
             msg_id: MsgId::new(),
             blob_dir,
+            window: WINDOW,
+            context: 0,
+            announced: Vec::new(),
         }
     }
 
@@ -468,9 +602,28 @@ impl Translator {
             Some("stream_event") if main => {
                 let event = &v["event"];
                 match event["type"].as_str() {
-                    Some("message_start") => self.msg_id = string(&event["message"]["id"]),
+                    Some("message_start") => {
+                        let message = &event["message"];
+                        self.msg_id = string(&message["id"]);
+                        let usage = &message["usage"];
+                        let tokens = |key: &str| usage[key].as_u64().unwrap_or(0);
+                        let used = tokens("input_tokens")
+                            + tokens("cache_creation_input_tokens")
+                            + tokens("cache_read_input_tokens");
+                        if used > 0 {
+                            self.context = used;
+                            out.push(AgentEvent::Context {
+                                used,
+                                window: self.window,
+                            });
+                        }
+                    }
                     Some("content_block_delta") => {
                         let delta = &event["delta"];
+                        // Hidden thinking streams as empty deltas; they would make empty rows.
+                        if delta["text"] == "" || delta["thinking"] == "" {
+                            return None;
+                        }
                         match delta["type"].as_str() {
                             Some("text_delta") => out.push(AgentEvent::TextDelta {
                                 msg_id: self.msg_id.clone(),
@@ -502,6 +655,7 @@ impl Translator {
                             call_id: string(&block["id"]),
                             kind: tool_kind(name),
                             title: tool_title(name, &block["input"]),
+                            detail: tool_detail(name, &block["input"]),
                         }),
                     }
                 }
@@ -543,7 +697,24 @@ impl Translator {
                     description: string(&request["description"]),
                 });
             }
+            Some("rate_limit_event") => self.rate_limit(&v["rate_limit_info"], out),
             Some("result") => {
+                // The CLI names the real window here; correct the meter if it differs.
+                let window = v["modelUsage"]
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|models| models.values())
+                    .filter_map(|m| m["contextWindow"].as_u64())
+                    .max();
+                if let Some(window) = window.filter(|&w| w != self.window) {
+                    self.window = window;
+                    if self.context > 0 {
+                        out.push(AgentEvent::Context {
+                            used: self.context,
+                            window,
+                        });
+                    }
+                }
                 let usage = &v["usage"];
                 let tokens = |key: &str| usage[key].as_u64().unwrap_or(0);
                 out.push(AgentEvent::Usage {
@@ -571,6 +742,70 @@ impl Translator {
             _ => {}
         }
         None
+    }
+}
+
+impl Translator {
+    /// Live usage limits, and a notice the first time a window blocks the turn.
+    fn rate_limit(&mut self, info: &Value, out: &mut Vec<AgentEvent>) {
+        let label = |key: &str| {
+            LIMIT_KEYS
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, label)| *label)
+        };
+        // `unifiedWindows` carries every window at once; older CLIs name only one.
+        let mut windows: Vec<LimitWindow> = LIMIT_KEYS
+            .iter()
+            .filter_map(|(key, label)| {
+                let w = &info["unifiedWindows"][*key];
+                Some(LimitWindow {
+                    label: (*label).into(),
+                    used: (w["utilization"].as_f64()? * 100.) as f32,
+                    resets_at: w["resetsAt"].as_i64().unwrap_or(0),
+                })
+            })
+            .collect();
+        let kind = info["rateLimitType"].as_str().unwrap_or_default();
+        if windows.is_empty()
+            && let (Some(label), Some(used)) = (label(kind), info["utilization"].as_f64())
+        {
+            windows.push(LimitWindow {
+                label: label.into(),
+                used: (used * 100.) as f32,
+                resets_at: info["resetsAt"].as_i64().unwrap_or(0),
+            });
+        }
+        if !windows.is_empty() {
+            out.push(AgentEvent::Limits { windows });
+        }
+        let overage = matches!(
+            info["overageStatus"].as_str(),
+            Some("allowed" | "allowed_warning")
+        ) || info["isUsingOverage"] == true;
+        if info["status"] != "rejected" || overage {
+            return;
+        }
+        let resets = info["resetsAt"].as_i64().unwrap_or(0);
+        let key = (kind.to_owned(), resets);
+        if self.announced.contains(&key) {
+            return;
+        }
+        self.announced.push(key);
+        let name = match kind {
+            "five_hour" => "5-hour ",
+            "seven_day" | "seven_day_opus" | "seven_day_sonnet" => "weekly ",
+            _ => "",
+        };
+        let wait = resets - now_secs();
+        let when = if wait > 0 && wait < 30 * 86_400 {
+            format!(" in {}", wait_text(wait))
+        } else {
+            String::new()
+        };
+        out.push(AgentEvent::Error {
+            message: format!("Claude usage limit reached. The {name}limit resets{when}."),
+        });
     }
 }
 
@@ -753,16 +988,44 @@ fn tool_title(name: &str, input: &Value) -> String {
     }
 }
 
+/// What an edit or write will change, as diff lines; empty for other tools.
+fn tool_detail(name: &str, input: &Value) -> String {
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
+    let mut lines = Vec::new();
+    match name {
+        "Edit" => {
+            diff_lines(&mut lines, '-', &text(&input["old_string"]), DETAIL_LINES);
+            diff_lines(&mut lines, '+', &text(&input["new_string"]), DETAIL_LINES);
+        }
+        "MultiEdit" => {
+            for (ix, edit) in blocks(&input["edits"]).iter().enumerate() {
+                if ix > 0 && lines.len() < DETAIL_LINES {
+                    lines.push("@@".into());
+                }
+                diff_lines(&mut lines, '-', &text(&edit["old_string"]), DETAIL_LINES);
+                diff_lines(&mut lines, '+', &text(&edit["new_string"]), DETAIL_LINES);
+            }
+        }
+        "Write" => diff_lines(&mut lines, '+', &text(&input["content"]), DETAIL_LINES),
+        "NotebookEdit" => diff_lines(&mut lines, '+', &text(&input["new_source"]), DETAIL_LINES),
+        _ => {}
+    }
+    lines.join("\n")
+}
+
 fn permission_detail(name: &str, input: &Value, description: &str) -> String {
     let body = match name {
         "Bash" | "PowerShell" => format!("```sh\n{}\n```", string(&input["command"])),
-        "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => format!(
-            "`{}`",
-            input["file_path"]
+        "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => {
+            let path = input["file_path"]
                 .as_str()
                 .or(input["notebook_path"].as_str())
-                .unwrap_or_default()
-        ),
+                .unwrap_or_default();
+            match tool_detail(name, input) {
+                diff if diff.is_empty() => format!("`{path}`"),
+                diff => format!("`{path}`\n\n```diff\n{diff}\n```"),
+            }
+        }
         _ => format!(
             "```json\n{}\n```",
             clip(

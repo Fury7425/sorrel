@@ -21,6 +21,18 @@ pub const ACCENTS: [&str; 8] = [
 /// Width of the sidebar and of the title bar's matching left part.
 pub const SIDEBAR: f32 = 252.;
 
+/// Critically damped: panels that push layout settle without overshoot.
+pub const SPRING_PANEL: SpringConfig = SpringConfig::new(520., 46., 1.);
+/// A touch under critical, so a moving thumb lands with a hint of settle.
+pub const SPRING_SNAP: SpringConfig = SpringConfig::new(600., 38., 1.);
+
+/// The sidebar's width as it opens and closes.
+pub fn sidebar_spring(open: bool) -> SpringAnimation<Pixels> {
+    SpringAnimation::new(SPRING_PANEL)
+        .to(px(if open { SIDEBAR } else { 0. }))
+        .with_epsilon(0.5)
+}
+
 /// `#rrggbb` as a color.
 pub fn parse_hex(hex: &str) -> Option<Hsla> {
     let hex = hex.strip_prefix('#')?;
@@ -220,10 +232,11 @@ pub fn wallpaper(path: &str, mode: Backdrop, scanlines: bool, background: Hsla) 
             linear_color_stop(background.opacity(0.0), 0.2),
             linear_color_stop(background.opacity(0.96), 0.62),
         )),
+        // Zeron keeps transcripts on a plain surface; only a tint of the picture stays.
         Backdrop::Session => div().absolute().inset_0().bg(linear_gradient(
             180.,
-            linear_color_stop(background.opacity(0.72), 0.0),
-            linear_color_stop(background.opacity(0.9), 0.6),
+            linear_color_stop(background.opacity(0.88), 0.0),
+            linear_color_stop(background.opacity(0.95), 0.5),
         )),
         Backdrop::Quiet => div().absolute().inset_0().bg(background.opacity(0.88)),
     };
@@ -390,4 +403,83 @@ pub fn ultra_hue(t: f32) -> Hsla {
     // Hue 0.58 (blue) to 0.92 (pink) and back.
     let wave = 0.5 - 0.5 * (t * std::f32::consts::TAU).cos();
     hsla(0.58 + 0.34 * wave, 0.85, 0.72, 1.)
+}
+
+/// A shortcut hint such as "Ctrl K", spelled for the platform.
+pub fn kbd(key: &str, mono: SharedString, color: Hsla) -> Div {
+    let keys = if cfg!(target_os = "macos") {
+        format!("⌘{key}")
+    } else {
+        format!("Ctrl {key}")
+    };
+    div()
+        .flex_shrink_0()
+        .px(px(5.))
+        .rounded(px(4.))
+        .border_1()
+        .border_color(color.opacity(0.35))
+        .font_family(mono)
+        .text_size(px(10.5))
+        .text_color(color)
+        .child(keys)
+}
+
+/// A 16px progress ring: a faint full track under a `fraction` arc from
+/// twelve o'clock. After Zeron's context ring (MIT).
+pub fn ring(fraction: f32, color: Hsla, track: Hsla) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let center = bounds.center();
+            let mut arc = |fraction: f32, color| {
+                if fraction <= 0. {
+                    return;
+                }
+                let steps = (64. * fraction).ceil().max(2.) as usize;
+                let mut path = PathBuilder::stroke(px(1.8));
+                for i in 0..=steps {
+                    let angle = -std::f32::consts::FRAC_PI_2
+                        + std::f32::consts::TAU * fraction * i as f32 / steps as f32;
+                    let p = point(
+                        center.x + px(6. * angle.cos()),
+                        center.y + px(6. * angle.sin()),
+                    );
+                    if i == 0 {
+                        path.move_to(p);
+                    } else {
+                        path.line_to(p);
+                    }
+                }
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, color);
+                }
+            };
+            arc(1., track);
+            arc(fraction.clamp(0., 1.), color);
+        },
+    )
+    .size(px(16.))
+}
+
+/// Muted below three quarters, then warning, then danger past nine tenths.
+pub fn level_color(fraction: f32, cx: &App) -> Hsla {
+    let theme = cx.theme();
+    match fraction {
+        f if f >= 0.9 => theme.danger,
+        f if f >= 0.75 => theme.warning,
+        _ => theme.muted_foreground,
+    }
+}
+
+/// 184000 as "184,000".
+pub fn grouped(count: u64) -> String {
+    let digits = count.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (ix, digit) in digits.chars().enumerate() {
+        if ix > 0 && (digits.len() - ix) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }

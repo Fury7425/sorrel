@@ -22,15 +22,16 @@ use gpui_kit::component::{
     message_scroller::{MessageScroller, MessageScrollerState},
     popover::Popover,
     switch::Switch,
-    text::{TextView, TextViewState},
+    text::{TextView, TextViewMotion, TextViewState},
     v_flex,
 };
+use gpui_kit::base::Easing;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use proto::{
-    Access, AgentEvent, BlobRef, Delivery, FileContent, FileEntry, Item, Mode, ModelInfo,
-    PermChoice, ProjectId, Provider, Request, Seq, StopReason, ThreadEvent, ThreadId, ThreadInfo,
-    TodoStatus, ToolKind, ToolStatus, Transcript, TurnSettings, ULTRACODE, ULTRATHINK,
+    Access, AgentEvent, BlobRef, Delivery, FileContent, FileEntry, Item, LimitWindow, Mode,
+    ModelInfo, PermChoice, ProjectId, Provider, Request, Seq, StopReason, ThreadEvent, ThreadId,
+    ThreadInfo, TodoStatus, ToolKind, ToolStatus, Transcript, TurnSettings, ULTRACODE, ULTRATHINK,
 };
 use tokio::sync::mpsc;
 
@@ -87,6 +88,8 @@ enum Picker {
     Model,
     Access,
     Project,
+    Context,
+    Limits,
 }
 
 enum Pane {
@@ -106,6 +109,8 @@ pub struct Look {
     pub enter_steers: bool,
     /// CLIs switched on in Settings.
     pub enabled: Vec<Provider>,
+    /// Each CLI's subscription usage limits, as last reported.
+    pub limits: HashMap<Provider, Vec<LimitWindow>>,
 }
 
 pub struct ThreadView {
@@ -120,6 +125,9 @@ pub struct ThreadView {
     /// The newest assistant row owns markdown state it appends to while it
     /// streams. Every other row uses keyed state that GPUI drops off screen.
     live: Option<(usize, Entity<TextViewState>)>,
+    /// Streamed text not yet handed to `live`; see [`Self::pace`].
+    pending: String,
+    pacing: bool,
     /// Worked rows the user opened, by their first item.
     opened: HashSet<usize>,
     scroller: Entity<MessageScrollerState>,
@@ -198,6 +206,8 @@ impl ThreadView {
             rows: Vec::new(),
             cache: Vec::new(),
             live: None,
+            pending: String::new(),
+            pacing: false,
             opened: HashSet::new(),
             scroller,
             older: None,
@@ -242,7 +252,7 @@ impl ThreadView {
             folder: Default::default(),
             running: false,
             needs_input: false,
-            queued: 0,
+            queue: Vec::new(),
             updated_at: 0,
             pinned: false,
             archived: false,
@@ -446,6 +456,7 @@ impl ThreadView {
             self.transcript = page;
             self.cache = vec![None; n];
             self.live = None;
+            self.pending.clear();
             self.opened.clear();
             self.rows = build_rows(&self.transcript.items, 0);
             let rows = self.rows.len();
@@ -481,14 +492,85 @@ impl ThreadView {
                 .filter(|(live_ix, _)| *live_ix == ix)
                 .map(|(_, state)| state.clone());
             match streaming {
-                Some(state) => state.update(cx, |state, cx| state.push_str(text, cx)),
+                Some(_) => self.pace(text, cx),
                 None => {
-                    let state = cx.new(|cx| TextViewState::markdown(full, cx));
+                    let full = full.clone();
+                    // A new reply: the last one shows in full at once.
+                    self.release(self.pending.len(), cx);
+                    let state = cx.new(|cx| TextViewState::markdown("", cx));
                     self.live = Some((ix, state));
+                    self.pace(&full, cx);
                 }
             }
         }
         cx.notify();
+    }
+
+    /// Feeds streamed text to the live reply at a steady pace. CLI deltas
+    /// land in bursts; letting them out a word at a time each frame, faster
+    /// the further behind it falls, reads as typing instead of jumps.
+    fn pace(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.pending.push_str(text);
+        if cx.reduce_motion() {
+            self.release(self.pending.len(), cx);
+            return;
+        }
+        if self.pacing {
+            return;
+        }
+        self.pacing = true;
+        cx.spawn(async move |this, cx| {
+            const TICK: Duration = Duration::from_millis(16);
+            // Backlog drains with this time constant, never slower than
+            // MIN_RATE characters a second.
+            const CATCH_UP: f32 = 0.3;
+            const MIN_RATE: f32 = 140.;
+            let mut budget = 0f32;
+            loop {
+                cx.background_executor().timer(TICK).await;
+                let more = this.update(cx, |this, cx| {
+                    let backlog = this.pending.len();
+                    let dt = TICK.as_secs_f32();
+                    budget += (backlog as f32 * dt / CATCH_UP).max(MIN_RATE * dt);
+                    if budget >= 1. && backlog > 0 {
+                        let mut end = (budget as usize).min(backlog);
+                        while !this.pending.is_char_boundary(end) {
+                            end += 1;
+                        }
+                        // Finish the word in progress, so each one arrives
+                        // whole and fades in as a unit.
+                        let rest = &this.pending[end..];
+                        if let Some(gap) = rest.find(char::is_whitespace).filter(|&g| g < 24) {
+                            end += gap;
+                        } else if rest.len() < 24 {
+                            end = backlog;
+                        }
+                        budget -= end as f32;
+                        this.release(end, cx);
+                    }
+                    let more = !this.pending.is_empty();
+                    this.pacing = more;
+                    more
+                });
+                if !more.unwrap_or(false) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Moves the first `len` bytes of pending text into the live reply.
+    fn release(&mut self, len: usize, cx: &mut Context<Self>) {
+        if len == 0 {
+            return;
+        }
+        let chunk: String = self.pending.drain(..len).collect();
+        if let Some((ix, state)) = self.live.clone() {
+            state.update(cx, |state, cx| state.push_str(&chunk, cx));
+            self.refresh_rows(ix, cx);
+            cx.notify();
+        }
     }
 
     /// Rebuilds the rows from the one holding item `changed` to the end.
@@ -692,7 +774,12 @@ impl ThreadView {
                     // CLI deltas arrive in bursts; fading each in word by
                     // word reads as a steady stream instead of jumps.
                     Some((live_ix, state)) if *live_ix == ix => TextView::new(state)
-                        .stream_fade(true)
+                        .motion(
+                            TextViewMotion::default()
+                                .with_stream_fade(Duration::from_millis(420))
+                                .with_stream_fade_stagger(Duration::from_millis(14))
+                                .with_stream_fade_easing(Easing::Ease),
+                        )
                         .into_any_element(),
                     _ => TextView::markdown(("md", ix), text).into_any_element(),
                 };
@@ -921,12 +1008,25 @@ impl ThreadView {
                 Item::Tool {
                     kind,
                     title,
+                    detail,
                     status,
                     output,
                     call_id,
                     ..
                 } => {
                     let expanded = self.expanded.iter().any(|(id, _)| *id == call_id);
+                    // An edit shows what it changed; its output only says it worked.
+                    let diff = (!detail.is_empty()).then(|| {
+                        div().ml(px(58.)).child(TextView::markdown(
+                            ("step-diff", ix),
+                            format!("```diff\n{detail}\n```"),
+                        ))
+                    });
+                    let text = if diff.is_some() && status != ToolStatus::Failed {
+                        SharedString::default()
+                    } else {
+                        text
+                    };
                     let tag = match kind {
                         ToolKind::Edit => primary,
                         _ => fg,
@@ -968,6 +1068,7 @@ impl ThreadView {
                                         .child(status_label(status)),
                                 ),
                         )
+                        .children(diff)
                         .when(!text.is_empty(), |el| {
                             el.child(
                                 div()
@@ -1330,24 +1431,29 @@ impl ThreadView {
         }
     }
 
-    /// The selected model's entry, or the provider's first when on default.
+    /// The selected model's entry, or the provider's first when on default
+    /// (the CLI lists its default first). An alias such as `sonnet` means
+    /// the newest of its family, which the CLI also lists first.
     fn model_info(&self) -> Option<ModelInfo> {
         let models = self.catalog.get(&self.provider())?;
         match &self.settings.model {
-            Some(id) => models.iter().find(|m| m.id == *id).cloned(),
+            Some(id) => {
+                let family = format!("-{id}-");
+                models
+                    .iter()
+                    .find(|m| m.id == *id)
+                    .or_else(|| models.iter().find(|m| m.id.contains(&family)))
+                    .cloned()
+            }
             None => models.first().cloned(),
         }
     }
 
     fn model_label(&self) -> String {
-        match &self.settings.model {
-            None => "Default".to_owned(),
-            Some(id) => self
-                .catalog
-                .get(&self.provider())
-                .and_then(|models| models.iter().find(|m| m.id == *id))
-                .map_or(id.clone(), |m| m.label.clone()),
-        }
+        self.model_info()
+            .map(|m| m.label)
+            .or_else(|| self.settings.model.clone())
+            .unwrap_or_else(|| "Default".to_owned())
     }
 
     fn render_model_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1368,7 +1474,7 @@ impl ThreadView {
         let effort = self.settings.effort.clone();
         let think = effort.as_deref() == Some(ULTRATHINK);
         let effort_text = effort.as_deref().map(effort_label).unwrap_or("").to_owned();
-        let trigger = Button::new("model-trigger").ghost().small().child(
+        let trigger = Button::new("model-trigger").ghost().small().bg(fg.opacity(0.08)).child(
             h_flex()
                 .gap_1p5()
                 .child(provider_icon(provider, 14.))
@@ -1483,17 +1589,14 @@ impl ThreadView {
 
         let slider = (!efforts.is_empty()).then(|| {
             let n = efforts.len();
-            // The fill runs from the left edge to the middle of the chosen stop.
-            let fill = selected.map(|s| {
-                let fill = div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .bottom_0()
-                    .w(relative((s as f32 + 0.5) / n as f32))
-                    .rounded_full();
-                if think {
-                    fill.with_animation(
+            // Fill and thumb are springs on one track position, so a click or
+            // drag glides between stops and a quick reversal turns around
+            // mid-flight instead of restarting.
+            let stop = |s: usize| (s as f32 + 0.5) / n as f32;
+            let fill_paint = div().size_full().rounded_full();
+            let fill_paint = if think {
+                fill_paint
+                    .with_animation(
                         "effort-flow",
                         Animation::new(Duration::from_millis(2600)).repeat(),
                         |el, t| {
@@ -1505,64 +1608,91 @@ impl ThreadView {
                         },
                     )
                     .into_any_element()
-                } else if code {
-                    fill.bg(linear_gradient(
+            } else if code {
+                fill_paint
+                    .bg(linear_gradient(
                         90.,
                         linear_color_stop(primary, 0.),
                         linear_color_stop(pink, 1.),
                     ))
                     .into_any_element()
-                } else {
-                    fill.bg(rail_fill).into_any_element()
-                }
-            });
+            } else {
+                fill_paint.bg(rail_fill).into_any_element()
+            };
+            // Clearing the effort drains the fill back to the left edge.
+            let fill = div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .bottom_0()
+                .rounded_full()
+                .overflow_hidden()
+                .child(fill_paint)
+                .with_spring(
+                    "effort-fill",
+                    SpringAnimation::new(style::SPRING_SNAP)
+                        .to(selected.map_or(0., stop))
+                        .with_epsilon(0.0005),
+                    |el, x| el.w(relative(x.max(0.))),
+                );
+            let thumb = div()
+                .w(px(30.))
+                .h(px(22.))
+                .rounded_full()
+                .bg(white())
+                .shadow_sm()
+                .with_spring(
+                    "effort-thumb-shown",
+                    SpringAnimation::new(style::SPRING_PANEL).to(selected.is_some()),
+                    |el, shown| el.opacity(shown.0.clamp(0., 1.)),
+                );
+            let thumb: AnyElement = if think {
+                thumb
+                    .with_animation(
+                        "thumb-glow",
+                        Animation::new(Duration::from_millis(2400)).repeat(),
+                        |el, t| {
+                            el.map_element(|el| {
+                                el.shadow(vec![BoxShadow {
+                                    color: ultra_hue(t).opacity(0.55),
+                                    offset: point(px(0.), px(0.)),
+                                    blur_radius: px(
+                                        10. + 8. * (t * std::f32::consts::TAU).sin().abs()
+                                    ),
+                                    spread_radius: px(0.),
+                                    inset: false,
+                                }])
+                            })
+                        },
+                    )
+                    .into_any_element()
+            } else {
+                thumb.into_any_element()
+            };
+            // Cleared, it slides home with the draining fill as it fades.
+            let thumb = div()
+                .absolute()
+                .top(px(3.))
+                .ml(px(-15.))
+                .child(thumb)
+                .with_spring(
+                    "effort-thumb",
+                    SpringAnimation::new(style::SPRING_SNAP)
+                        .to(stop(selected.unwrap_or(0)))
+                        .with_epsilon(0.0005),
+                    |el, x| el.left(relative(x)),
+                );
             let cells = h_flex()
                 .absolute()
                 .inset_0()
                 .children(efforts.iter().enumerate().map(|(i, effort)| {
-                    let is_sel = selected == Some(i);
                     let passed = selected.is_some_and(|s| i < s);
                     let pick = Some(effort.clone());
-                    let mark: AnyElement = if is_sel {
-                        let thumb = div()
-                            .w(px(30.))
-                            .h(px(22.))
-                            .rounded_full()
-                            .bg(white())
-                            .shadow_sm();
-                        if think {
-                            thumb
-                                .with_animation(
-                                    "thumb-glow",
-                                    Animation::new(Duration::from_millis(2400)).repeat(),
-                                    |el, t| {
-                                        el.shadow(vec![BoxShadow {
-                                            color: ultra_hue(t).opacity(0.55),
-                                            offset: point(px(0.), px(0.)),
-                                            blur_radius: px(
-                                                10. + 8. * (t * std::f32::consts::TAU).sin().abs()
-                                            ),
-                                            spread_radius: px(0.),
-                                            inset: false,
-                                        }])
-                                    },
-                                )
-                                .into_any_element()
-                        } else {
-                            thumb.into_any_element()
-                        }
-                    } else {
-                        let color = match effort.as_str() {
-                            ULTRATHINK => ultra_hue(0.),
-                            ULTRACODE => pink,
-                            _ if passed => white().opacity(0.75),
-                            _ => fg.opacity(0.3),
-                        };
-                        div()
-                            .size(px(4.))
-                            .rounded_full()
-                            .bg(color)
-                            .into_any_element()
+                    let color = match effort.as_str() {
+                        ULTRATHINK => ultra_hue(0.),
+                        ULTRACODE => pink,
+                        _ if passed => white().opacity(0.75),
+                        _ => fg.opacity(0.3),
                     };
                     div()
                         .id(("effort", i))
@@ -1572,7 +1702,7 @@ impl ThreadView {
                         .items_center()
                         .justify_center()
                         .cursor_pointer()
-                        .child(mark)
+                        .child(div().size(px(4.)).rounded_full().bg(color))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             // The chosen stop again hands effort back to the CLI.
                             let effort = if this.settings.effort == pick {
@@ -1614,8 +1744,9 @@ impl ThreadView {
                 ))
                 .rounded_full()
                 .bg(fg.opacity(0.07))
-                .children(fill)
-                .child(cells);
+                .child(fill)
+                .child(cells)
+                .child(thumb);
             let labels = h_flex().children(efforts.iter().enumerate().map(|(i, effort)| {
                 let is_sel = selected == Some(i);
                 div()
@@ -1653,6 +1784,8 @@ impl ThreadView {
 
         let has_model = self.settings.model.is_some();
         let long = self.settings.long_context;
+        // Fast mode only where the CLI says the model has it; left visible while on, to turn off.
+        let fast_ok = self.settings.fast || self.model_info().is_none_or(|m| m.fast);
         v_flex()
             .gap_3()
             .child(header)
@@ -1681,7 +1814,7 @@ impl ThreadView {
             })
             .when(claude, |el| {
                 el.child(div().h(px(1.)).bg(fg.opacity(0.08)))
-                    .child(
+                    .when(fast_ok, |el| el.child(
                         h_flex()
                             .gap_2p5()
                             .child(
@@ -1716,7 +1849,7 @@ impl ThreadView {
                                         this.set_settings(settings, cx);
                                     })),
                             ),
-                    )
+                    ))
                     .child(
                         h_flex()
                             .gap_2p5()
@@ -2084,9 +2217,14 @@ impl ThreadView {
                 Button::new("access-trigger")
                     .ghost()
                     .xsmall()
-                    .icon(Lucide::Lock)
-                    .label(current.label())
-                    .text_color(muted),
+                    .text_color(muted)
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .child(Icon::new(Lucide::Lock).xsmall())
+                            .child(current.label())
+                            .child(Icon::new(IconName::ChevronDown).xsmall()),
+                    ),
             )
             .w(px(300.))
             .p_1()
@@ -2153,6 +2291,32 @@ impl ThreadView {
     }
 
     /// Commands matching what follows a leading `/`.
+    /// Asks the OS for files and adds their paths to the message; every CLI
+    /// reads a path it is given, images included.
+    fn attach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths.await {
+                let text: String = paths
+                    .iter()
+                    .map(|p| format!("\"{}\" ", p.display()))
+                    .collect();
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.composer.update(cx, |composer, cx| {
+                        composer.insert(text, window, cx);
+                        composer.focus(window, cx);
+                    });
+                });
+            }
+        })
+        .detach();
+    }
+
     fn slash_matches(&self, cx: &App) -> Vec<String> {
         let value = self.composer.read(cx).value();
         let Some(query) = value.strip_prefix('/') else {
@@ -2175,11 +2339,230 @@ impl ThreadView {
             .unwrap_or_default()
     }
 
+    /// Messages waiting for the running turn, as a tray on top of the
+    /// composer (after Zeron's queue): drop one, pull it back into the
+    /// composer to edit, or fold it into the running turn now.
+    fn render_queue(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let queue = self.info.as_ref().map(|info| info.queue.clone())?;
+        if queue.is_empty() {
+            return None;
+        }
+        let theme = cx.theme();
+        let (fg, muted, background) = (theme.foreground, theme.muted_foreground, theme.background);
+        let thread = self.id;
+        let rows = queue.into_iter().enumerate().map(|(index, text)| {
+            let line = text.lines().next().unwrap_or_default().to_owned();
+            h_flex()
+                .id(("queued", index))
+                .group("queued")
+                .gap_1()
+                .h(px(32.))
+                .pl_3()
+                .pr_1()
+                .rounded_lg()
+                .hover(move |style| style.bg(fg.opacity(0.04)))
+                .child(
+                    div()
+                        .w(px(16.))
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("{}", index + 1)),
+                )
+                .child(div().flex_1().min_w_0().truncate().text_sm().child(line))
+                .child(
+                    Button::new(("unqueue", index))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Delete)
+                        .text_color(muted)
+                        .tooltip("Remove")
+                        .on_click(cx.listener(move |this, _, _, _| {
+                            this.request(Request::Unqueue { thread, index })
+                        })),
+                )
+                .child(
+                    Button::new(("edit-queued", index))
+                        .ghost()
+                        .xsmall()
+                        .icon(Lucide::SquarePen)
+                        .text_color(muted)
+                        .tooltip("Edit")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.request(Request::Unqueue { thread, index });
+                            let text = text.clone();
+                            this.composer.update(cx, |composer, cx| {
+                                composer.set_value(text, window, cx);
+                                composer.focus(window, cx);
+                            });
+                        })),
+                )
+                .child(
+                    Button::new(("steer-queued", index))
+                        .ghost()
+                        .xsmall()
+                        .label("Send now")
+                        .on_click(cx.listener(move |this, _, _, _| {
+                            this.request(Request::SteerQueued { thread, index })
+                        })),
+                )
+        });
+        Some(
+            v_flex()
+                .mx_4()
+                .p_1()
+                .rounded_t(px(14.))
+                .bg(background.opacity(0.5))
+                .border_1()
+                .border_b_0()
+                .border_color(fg.opacity(0.08))
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    /// The rings under the composer: plan usage and context, each opening
+    /// its numbers (Zeron's footer).
+    fn render_meters(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (fg, muted, popover) = (theme.foreground, theme.muted_foreground, theme.popover);
+        let track = muted.opacity(0.25);
+        let provider = self.provider();
+        let chip = |id: &'static str, fraction: f32, label: String, cx: &App| {
+            let color = style::level_color(fraction, cx);
+            Button::new(id).ghost().xsmall().child(
+                h_flex()
+                    .gap(px(5.))
+                    .text_size(px(11.))
+                    .text_color(color)
+                    .child(style::ring(fraction, color, track))
+                    .child(label),
+            )
+        };
+        let card = |title: &'static str| {
+            v_flex().gap_2().child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(muted)
+                    .child(title),
+            )
+        };
+
+        let limits = self
+            .look
+            .limits
+            .get(&provider)
+            .filter(|windows| !windows.is_empty())
+            .cloned()
+            .map(|windows| {
+                let most = windows.iter().map(|w| w.used).fold(0., f32::max) / 100.;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64);
+                let rows = windows.into_iter().map(|w| {
+                    let fraction = w.used / 100.;
+                    let color = style::level_color(fraction, cx);
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .text_sm()
+                                .child(w.label)
+                                .child(
+                                    div()
+                                        .text_color(color)
+                                        .child(format!("{:.0}% used", w.used)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .h(px(4.))
+                                .rounded_full()
+                                .bg(fg.opacity(0.08))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .rounded_full()
+                                        .bg(color)
+                                        .w(relative(fraction.clamp(0., 1.))),
+                                ),
+                        )
+                        .when(w.resets_at > now, |el| {
+                            el.child(div().text_xs().text_color(muted).child(format!(
+                                "Resets in {}",
+                                proto::wait_text(w.resets_at - now)
+                            )))
+                        })
+                });
+                Popover::new("limits-meter")
+                    .anchor(Anchor::BottomRight)
+                    .open(self.picker == Some(Picker::Limits))
+                    .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                        this.picker = open.then_some(Picker::Limits);
+                        cx.notify();
+                    }))
+                    .trigger(
+                        chip("limits-trigger", most, format!("{:.0}%", most * 100.), cx)
+                            .tooltip("Plan usage"),
+                    )
+                    .w(px(260.))
+                    .p_3()
+                    .bg(popover.opacity(0.98))
+                    .child(card("PLAN USAGE").children(rows))
+            });
+
+        let context = self.transcript.context.filter(|&(_, w)| w > 0).map(|(used, window)| {
+            let fraction = used as f32 / window as f32;
+            Popover::new("context-meter")
+                .anchor(Anchor::BottomRight)
+                .open(self.picker == Some(Picker::Context))
+                .on_open_change(cx.listener(|this, open: &bool, _, cx| {
+                    this.picker = open.then_some(Picker::Context);
+                    cx.notify();
+                }))
+                .trigger(
+                    chip(
+                        "context-trigger",
+                        fraction,
+                        format!("{:.0}%", fraction * 100.),
+                        cx,
+                    )
+                    .tooltip("Context window"),
+                )
+                .w(px(240.))
+                .p_3()
+                .bg(popover.opacity(0.98))
+                .child(
+                    card("CONTEXT WINDOW").child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(format!(
+                                "{} / {} tokens",
+                                style::grouped(used),
+                                style::grouped(window)
+                            ))
+                            .child(div().child(format!(
+                                "{} tokens left",
+                                style::grouped(window.saturating_sub(used))
+                            ))),
+                    ),
+                )
+        });
+        h_flex()
+            .gap_0p5()
+            .children(limits)
+            .children(context)
+            .into_any_element()
+    }
+
     fn render_composer(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let running = self.running();
         let chat = self.is_chat();
         let draft = self.is_draft();
-        let queued = self.info.as_ref().map_or(0, |info| info.queued);
+        let queue = self.render_queue(cx);
+        let meters = self.render_meters(cx);
         let pending = self.pending().map(|ix| self.render_pending(ix, cx));
         let model = self.render_model_picker(cx);
         let access = (!chat).then(|| self.render_access_picker(cx));
@@ -2222,15 +2605,6 @@ impl ThreadView {
         let actions = if running {
             h_flex()
                 .gap_1()
-                .when(queued > 0, |el| {
-                    el.child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .mr_1()
-                            .child(format!("{queued} queued")),
-                    )
-                })
                 .when(!chat, |el| {
                     el.child(
                         Button::new("steer")
@@ -2288,13 +2662,29 @@ impl ThreadView {
                     .appearance(false)
                     .bordered(false),
             )
-            .child(h_flex().items_center().child(div().flex_1()).child(actions))
+            .child(
+                h_flex()
+                    .items_center()
+                    .child(
+                        Button::new("attach")
+                            .ghost()
+                            .small()
+                            .icon(Lucide::Paperclip)
+                            .text_color(muted)
+                            .tooltip("Attach files")
+                            .on_click(cx.listener(|this, _, window, cx| this.attach(window, cx))),
+                    )
+                    .child(div().flex_1())
+                    .child(actions),
+            )
             // A beam rides the border while the agent works (libraries.dev's border beam, drawn natively).
             .when(running, |el| {
                 el.child(style::border_beam("composer-beam", primary))
             });
 
-        let under = (!chat).then(|| {
+        let under = if chat {
+            h_flex().px_1p5().child(div().flex_1()).child(meters)
+        } else {
             h_flex()
                 .gap_1()
                 .px_1p5()
@@ -2323,7 +2713,8 @@ impl ThreadView {
                 )
                 .children(access)
                 .child(div().flex_1())
-        });
+                .child(meters)
+        };
 
         let column = self.column();
         div()
@@ -2340,8 +2731,8 @@ impl ThreadView {
                     .when_some(project, |el, project| {
                         el.child(h_flex().justify_end().px_1p5().child(project))
                     })
-                    .child(boxed)
-                    .children(under),
+                    .child(v_flex().children(queue).child(boxed))
+                    .child(under),
             )
             .into_any_element()
     }

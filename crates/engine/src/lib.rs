@@ -21,9 +21,9 @@ use std::{
 
 use drivers::{DriverCommand, SessionConfig, acp, blob, claude, codex};
 use proto::{
-    AgentEvent, AuthState, AuthStatus, Delivery, McpServer, Mode, MsgId, ProjectId, ProjectInfo,
-    Provider, Request, Seq, StopReason, TaskId, ThreadEvent, ThreadId, ThreadInfo, TurnSettings,
-    Update,
+    AgentEvent, AuthState, AuthStatus, Delivery, LimitWindow, McpServer, Mode, MsgId, ProjectId,
+    ProjectInfo, Provider, Request, Seq, StopReason, TaskId, ThreadEvent, ThreadId, ThreadInfo,
+    TurnSettings, Update,
 };
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc};
@@ -38,6 +38,8 @@ const PAGE_ITEMS: usize = 50;
 /// Idle driver tasks kept around; the oldest idle one goes beyond this.
 const MAX_KEPT_SESSIONS: usize = 32;
 const NEW_TITLE: &str = "New chat";
+/// Usage limits are asked for at most this often outside of turns.
+const LIMITS_EVERY: Duration = Duration::from_secs(300);
 
 /// How clients reach a running engine. Cheap to clone.
 #[derive(Clone)]
@@ -65,6 +67,7 @@ pub fn start(data_dir: PathBuf) -> Result<Handle, String> {
     let (updates, _) = broadcast::channel(4096);
     let (agent_tx, agent_rx) = mpsc::channel(4096);
     let (notice_tx, notice_rx) = mpsc::channel(64);
+    let (job_tx, job_rx) = mpsc::channel(64);
     let engine = Engine {
         settings: files::Settings::load(&dirs.data),
         memory: fs::read_to_string(&dirs.memory).unwrap_or_default(),
@@ -78,8 +81,11 @@ pub fn start(data_dir: PathBuf) -> Result<Handle, String> {
         running: 0,
         waiting: VecDeque::new(),
         checkpoints: true,
+        job_tx,
+        limits: HashMap::new(),
+        limits_checked: None,
     };
-    tokio::spawn(engine.run(request_rx, agent_rx, notice_rx));
+    tokio::spawn(engine.run(request_rx, agent_rx, notice_rx, job_rx));
     Ok(Handle { requests, updates })
 }
 
@@ -105,6 +111,17 @@ impl Dirs {
         }
         Ok(dirs)
     }
+}
+
+/// Results of background work that the actor applies in order.
+enum Job {
+    /// A generated title for a thread still named `was`.
+    Title {
+        thread: ThreadId,
+        was: String,
+        title: String,
+    },
+    Limits(Provider, Vec<LimitWindow>),
 }
 
 /// A thread with a live driver task.
@@ -142,6 +159,10 @@ struct Engine {
     waiting: VecDeque<ThreadId>,
     /// Off once git turned out to be missing.
     checkpoints: bool,
+    job_tx: mpsc::Sender<Job>,
+    /// Each CLI's usage limits as last reported.
+    limits: HashMap<Provider, Vec<LimitWindow>>,
+    limits_checked: Option<Instant>,
 }
 
 fn db<T>(result: rusqlite::Result<T>) -> Result<T, String> {
@@ -154,6 +175,7 @@ impl Engine {
         mut requests: mpsc::Receiver<Request>,
         mut agent_rx: mpsc::Receiver<(ThreadId, AgentEvent)>,
         mut notice_rx: mpsc::Receiver<(String, Value)>,
+        mut job_rx: mpsc::Receiver<Job>,
     ) {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         loop {
@@ -168,6 +190,7 @@ impl Engine {
                 },
                 Some((thread, event)) = agent_rx.recv() => self.on_agent(thread, event).await,
                 Some((method, params)) = notice_rx.recv() => self.on_codex_notice(&method, &params),
+                Some(job) = job_rx.recv() => self.on_job(job),
                 _ = tick.tick() => {
                     if let Err(message) = self.run_due_tasks().await {
                         self.notice(message, true);
@@ -209,7 +232,14 @@ impl Engine {
                     settings: self.settings.view(&self.dirs.data),
                     memory: self.memory.clone(),
                 });
+                for (&provider, windows) in &self.limits {
+                    self.send(Update::Limits {
+                        provider,
+                        windows: windows.clone(),
+                    });
+                }
                 self.check_auth();
+                self.check_limits(false);
             }
             Request::CreateProject { name, folder } => {
                 let name = if name.trim().is_empty() {
@@ -378,6 +408,7 @@ impl Engine {
             Request::Usage { since } => {
                 let (rows, daily) = db(self.store.usage(since))?;
                 self.send(Update::Usage { rows, daily });
+                self.check_limits(true);
             }
             Request::ListDir { path } => {
                 let (path, dirs) = tokio::task::spawn_blocking(move || files::list_dir(&path))
@@ -393,6 +424,22 @@ impl Engine {
                     let _ = session.commands.try_send(DriverCommand::Interrupt);
                 }
                 self.send(Update::Threads(self.threads()?));
+            }
+            Request::Unqueue { thread, index } => {
+                if let Some(session) = self.sessions.get_mut(&thread) {
+                    session.queue.remove(index);
+                }
+                self.send(Update::Threads(self.threads()?));
+            }
+            Request::SteerQueued { thread, index } => {
+                let message = self
+                    .sessions
+                    .get_mut(&thread)
+                    .and_then(|session| session.queue.remove(index));
+                if let Some((text, settings)) = message {
+                    self.send_message(thread, text, settings, Delivery::SteerNow)
+                        .await?;
+                }
             }
             Request::Resolve {
                 thread,
@@ -559,7 +606,9 @@ impl Engine {
                     folder: t.folder,
                     running: session.is_some_and(|s| s.running || s.waiting),
                     needs_input: session.is_some_and(|s| s.pending > 0),
-                    queued: session.map_or(0, |s| s.queue.len()),
+                    queue: session.map_or_else(Vec::new, |s| {
+                        s.queue.iter().map(|(text, _)| text.clone()).collect()
+                    }),
                     settings: t.settings,
                     chat: t.chat,
                     updated_at: t.updated_at,
@@ -838,6 +887,7 @@ impl Engine {
                 .take(60)
                 .collect();
             db(self.store.set_title(thread, &title))?;
+            self.retitle(thread, row.provider, title, text.clone());
         }
         self.ensure_session(thread, false)?;
         let session = self.sessions.get_mut(&thread).expect("ensured above");
@@ -939,6 +989,12 @@ impl Engine {
                     thread,
                     event: ThreadEvent::Agent(AgentEvent::ThinkingDelta { msg_id, text }),
                 });
+                Ok(())
+            }
+            AgentEvent::Limits { windows } => {
+                if let Some(session) = self.sessions.get(&thread) {
+                    self.on_job(Job::Limits(session.provider, windows));
+                }
                 Ok(())
             }
             AgentEvent::Commands { names } => {
@@ -1264,7 +1320,87 @@ impl Engine {
                 self.notice(format!("Codex sign-in failed: {error}"), true);
             }
             "account/updated" => self.check_auth(),
+            "account/rateLimits/updated" => {
+                let windows = codex::limits(params);
+                if !windows.is_empty() {
+                    self.on_job(Job::Limits(Provider::Codex, windows));
+                }
+            }
             _ => {}
+        }
+    }
+
+    fn on_job(&mut self, job: Job) {
+        match job {
+            Job::Title { thread, was, title } => {
+                // Unless the user renamed it meanwhile.
+                if let Ok(Some(row)) = self.store.thread(thread)
+                    && row.title == was
+                    && self.store.set_title(thread, &title).is_ok()
+                    && let Ok(threads) = self.threads()
+                {
+                    self.send(Update::Threads(threads));
+                }
+            }
+            Job::Limits(provider, windows) => {
+                if self.limits.get(&provider) != Some(&windows) {
+                    self.send(Update::Limits {
+                        provider,
+                        windows: windows.clone(),
+                    });
+                    self.limits.insert(provider, windows);
+                }
+            }
+        }
+    }
+
+    /// Names a new Claude thread from its first message in the background.
+    /// Other CLIs keep the first line: sending their user's words to another
+    /// vendor just for a title would surprise them.
+    fn retitle(&self, thread: ThreadId, provider: Provider, was: String, message: String) {
+        if provider != Provider::Claude || self.settings.config(provider).disabled {
+            return;
+        }
+        let (bin, key) = (self.settings.bin(provider), self.settings.key_for(provider));
+        let (_, env) = self.settings.extra(provider);
+        let jobs = self.job_tx.clone();
+        tokio::spawn(async move {
+            if let Ok(title) = claude::title(bin, key, env, &message).await {
+                let _ = jobs.send(Job::Title { thread, was, title }).await;
+            }
+        });
+    }
+
+    /// Asks each signed-in CLI for its usage limits, at most every few
+    /// minutes unless `now`. Codex is asked only once its app-server runs.
+    fn check_limits(&mut self, now: bool) {
+        if !now && self.limits_checked.is_some_and(|at| at.elapsed() < LIMITS_EVERY) {
+            return;
+        }
+        self.limits_checked = Some(Instant::now());
+        let claude_on = !self.settings.config(Provider::Claude).disabled
+            && self.settings.key_for(Provider::Claude).is_none();
+        if claude_on {
+            let bin = self.settings.bin(Provider::Claude);
+            let (_, env) = self.settings.extra(Provider::Claude);
+            let jobs = self.job_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(windows) = claude::usage_limits(bin, None, env).await
+                    && !windows.is_empty()
+                {
+                    let _ = jobs.send(Job::Limits(Provider::Claude, windows)).await;
+                }
+            });
+        }
+        if let Some(server) = self.codex.clone() {
+            let jobs = self.job_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(windows) = server.rate_limits().await
+                    && !windows.is_empty()
+                {
+                    let _ = jobs.send(Job::Limits(Provider::Codex, windows)).await;
+                }
+            });
         }
     }
 

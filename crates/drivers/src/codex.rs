@@ -25,8 +25,8 @@ use std::{
 };
 
 use proto::{
-    Access, AgentEvent, AuthState, McpServer, Mode, ModelInfo, PermChoice, Question, StopReason,
-    TodoItem, TodoStatus, ToolKind, ToolStatus, TurnSettings,
+    Access, AgentEvent, AuthState, LimitWindow, McpServer, Mode, ModelInfo, PermChoice, Question,
+    StopReason, TodoItem, TodoStatus, ToolKind, ToolStatus, TurnSettings,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -223,8 +223,18 @@ impl Server {
                     .iter()
                     .filter_map(|option| option["reasoningEffort"].as_str().map(str::to_owned))
                     .collect(),
+                fast: false,
             })
             .collect())
+    }
+
+    /// The ChatGPT plan's usage limits; empty in API-key mode.
+    pub async fn rate_limits(&self) -> Result<Vec<LimitWindow>, String> {
+        let peer = self.peer().await?;
+        let reply = peer
+            .request("account/rateLimits/read", json!({}), REQUEST_TIMEOUT)
+            .await?;
+        Ok(limits(&reply))
     }
 
     /// Starts Codex's own ChatGPT sign-in and returns the page to open.
@@ -622,6 +632,7 @@ pub fn translate(
                     call_id: string(&item["id"]),
                     kind,
                     title,
+                    detail: change_detail(item),
                 });
             }
         }
@@ -658,11 +669,18 @@ pub fn translate(
                 .collect(),
         }),
         "thread/tokenUsage/updated" => {
-            let last = &params["tokenUsage"]["last"];
+            let usage = &params["tokenUsage"];
+            let last = &usage["last"];
             out.push(AgentEvent::Usage {
                 input: last["inputTokens"].as_u64().unwrap_or(0),
                 output: last["outputTokens"].as_u64().unwrap_or(0),
             });
+            if let (Some(used), Some(window)) = (
+                last["totalTokens"].as_u64(),
+                usage["modelContextWindow"].as_u64(),
+            ) {
+                out.push(AgentEvent::Context { used, window });
+            }
         }
         "turn/completed" => {
             let turn = &params["turn"];
@@ -716,6 +734,59 @@ fn tool(item: &Value) -> Option<(ToolKind, String)> {
         _ => return None,
     };
     Some((title.0, clip(&title.1, 200)))
+}
+
+/// A file change's diffs, for the tool row and its approval card.
+fn change_detail(item: &Value) -> String {
+    if item["type"] != "fileChange" {
+        return String::new();
+    }
+    let mut lines = Vec::new();
+    for change in item["changes"].as_array().map(Vec::as_slice).unwrap_or_default() {
+        crate::diff_lines(&mut lines, ' ', change["diff"].as_str().unwrap_or_default(), 160);
+    }
+    // The diffs are already unified; drop the padding `diff_lines` added.
+    lines
+        .iter()
+        .map(|line| line.strip_prefix(' ').unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("
+")
+}
+
+/// Usage-limit windows from a rate-limit snapshot, as `account/rateLimits/read`
+/// answers and `account/rateLimits/updated` sends. Only the main `codex`
+/// allowance; model-specific buckets would replace its rows.
+pub fn limits(params: &Value) -> Vec<LimitWindow> {
+    let snapshot = match &params["rateLimitsByLimitId"]["codex"] {
+        Value::Null => &params["rateLimits"],
+        main => main,
+    };
+    if snapshot["limitId"].as_str().is_some_and(|id| id != "codex") {
+        return Vec::new();
+    }
+    let monthly_plan = matches!(snapshot["planType"].as_str(), Some("free" | "go"));
+    let positions = [
+        (&snapshot["primary"], if monthly_plan { 30 * 1440 } else { 300 }),
+        (&snapshot["secondary"], 7 * 1440),
+    ];
+    positions
+        .into_iter()
+        .filter_map(|(window, fallback)| {
+            let used = window["usedPercent"].as_f64()?;
+            let minutes = window["windowDurationMins"].as_i64().unwrap_or(fallback);
+            Some(LimitWindow {
+                label: match minutes {
+                    m if m >= 30 * 1440 => "Monthly",
+                    m if m >= 7 * 1440 => "Weekly",
+                    _ => "Session",
+                }
+                .into(),
+                used: used.clamp(0., 100.) as f32,
+                resets_at: window["resetsAt"].as_i64().unwrap_or(0),
+            })
+        })
+        .collect()
 }
 
 fn tool_output(item: &Value) -> String {
@@ -802,7 +873,8 @@ mod tests {
                 AgentEvent::ToolCall {
                     call_id: "c1".into(),
                     kind: ToolKind::Execute,
-                    title: "Run: ls".into()
+                    title: "Run: ls".into(),
+                    detail: String::new(),
                 },
                 AgentEvent::ToolUpdate {
                     call_id: "c1".into(),

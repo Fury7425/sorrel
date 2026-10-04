@@ -1,0 +1,16 @@
+[
+{"SessionStarted":{"session_id":"f9f887d5-d7c5-43c0-b7fc-a4d66ec327d8","model":"claude-haiku-4-5-20251001"}},
+{"Commands":{"names":["compact","review"]}},
+{"Context":{"used":38662,"window":200000}},
+{"ToolCall":{"call_id":"toolu_018u6FhbU4mwJA8i9MEky2HH","kind":"Read","title":"Read: C:\\work\\a.txt","detail":""}},
+{"Limits":{"windows":[{"label":"Session","used":77.0,"resets_at":1791130200},{"label":"Weekly","used":74.0,"resets_at":1791597600}]}},
+{"ToolUpdate":{"call_id":"toolu_018u6FhbU4mwJA8i9MEky2HH","status":"Done","preview":"1\thello world\n2\t","output":null}},
+{"Context":{"used":39860,"window":200000}},
+{"TextDelta":{"msg_id":"msg_011CfhKUnu8s93zfjAMSJF5z","text":"Contents"}},
+{"TextDelta":{"msg_id":"msg_011CfhKUnu8s93zfjAMSJF5z","text":":"}},
+{"TextDelta":{"msg_id":"msg_011CfhKUnu8s93zfjAMSJF5z","text":" `"}},
+{"TextDelta":{"msg_id":"msg_011CfhKUnu8s93zfjAMSJF5z","text":"hello world`"}},
+{"Limits":{"windows":[{"label":"Session","used":78.0,"resets_at":1791130200},{"label":"Weekly","used":74.0,"resets_at":1791597600}]}},
+{"Usage":{"input":78522,"output":239}},
+{"TurnEnded":{"reason":"EndTurn"}}
+]

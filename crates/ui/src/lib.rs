@@ -11,6 +11,7 @@ mod style;
 mod thread;
 
 use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _, Theme, ThemeMode,
@@ -23,15 +24,17 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use proto::{
-    AuthState, AuthStatus, ModelInfo, OpenIn, Preferences, ProjectId, ProjectInfo, Provider, Request,
+    AuthState, AuthStatus, LimitWindow, ModelInfo, OpenIn, Preferences, ProjectId, ProjectInfo, Provider, Request,
     SettingsView, TaskInfo, ThreadId, ThreadInfo, TurnSettings, Update, UsageReport,
 };
 use tokio::sync::mpsc;
 
 pub use thread::ThreadView;
 
-use style::{Backdrop, SIDEBAR};
+use style::{Backdrop, SIDEBAR, sidebar_spring};
 use thread::Look;
+
+actions!(sorrel, [NewThread, FocusSearch]);
 
 /// Notices kept on screen; older ones drop off.
 const MAX_NOTICES: usize = 3;
@@ -101,6 +104,8 @@ struct Editors {
 
 pub struct Workspace {
     requests: mpsc::Sender<Request>,
+    /// Holds keyboard focus when no field does, so shortcuts still reach us.
+    focus: FocusHandle,
     projects: Vec<ProjectInfo>,
     threads: Vec<ThreadInfo>,
     tasks: Vec<TaskInfo>,
@@ -108,6 +113,8 @@ pub struct Workspace {
     settings: SettingsView,
     catalog: HashMap<Provider, Vec<ModelInfo>>,
     commands: HashMap<Provider, Vec<String>>,
+    /// Each CLI's subscription usage limits, as last reported.
+    limits: HashMap<Provider, Vec<LimitWindow>>,
     /// Chat side rather than Code side.
     chat: bool,
     /// The opening side was chosen from the preferences.
@@ -293,8 +300,16 @@ impl Workspace {
             )
         });
 
+        cx.bind_keys([
+            KeyBinding::new("secondary-n", NewThread, None),
+            KeyBinding::new("secondary-k", FocusSearch, None),
+        ]);
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+
         Self {
             requests,
+            focus,
             projects: Vec::new(),
             threads: Vec::new(),
             tasks: Vec::new(),
@@ -302,6 +317,7 @@ impl Workspace {
             settings: SettingsView::default(),
             catalog: HashMap::new(),
             commands: HashMap::new(),
+            limits: HashMap::new(),
             chat: false,
             started: false,
             view: View::Home,
@@ -440,6 +456,10 @@ impl Workspace {
             }
             Update::Commands { provider, names } => {
                 self.commands.insert(provider, names);
+                self.sync_views(cx);
+            }
+            Update::Limits { provider, windows } => {
+                self.limits.insert(provider, windows);
                 self.sync_views(cx);
             }
             Update::Memory(_) => {}
@@ -595,6 +615,7 @@ impl Workspace {
                 .map(|p| (p.id, p.name.clone()))
                 .collect(),
             enter_steers: prefs.enter_steers,
+            limits: self.limits.clone(),
             enabled: self
                 .settings
                 .providers
@@ -941,8 +962,10 @@ impl Workspace {
         let nav = h_flex()
             .occlude()
             .gap_0p5()
-            .when(self.sidebar_open, |el| el.w(px(SIDEBAR - 6.)))
             .flex_shrink_0()
+            .with_spring("sidebar-nav", sidebar_spring(self.sidebar_open), |el, w| {
+                el.min_w(w * ((SIDEBAR - 6.) / SIDEBAR))
+            })
             .child(
                 Button::new("toggle-sidebar")
                     .ghost()
@@ -1218,12 +1241,20 @@ impl Workspace {
                 .shadow_lg()
                 .text_sm()
         };
+        // Toasts rise into place; dismissal is instant, as leaving should be.
+        let rise = |id: ElementId, pill: Div| {
+            pill.with_animation(
+                id,
+                Animation::new(Duration::from_millis(240)).with_easing(ease_out_quint()),
+                |el, t| el.opacity(t).mt(px(10. * (1. - t))),
+            )
+        };
         let notices = self
             .notices
             .iter()
             .enumerate()
             .map(|(ix, (message, error))| {
-                pill(h_flex())
+                let pill = pill(h_flex())
                     .when(*error, |el| el.text_color(danger))
                     .child(div().max_w(px(560.)).child(message.clone()))
                     .child(
@@ -1235,10 +1266,11 @@ impl Workspace {
                                 this.notices.remove(ix);
                                 cx.notify();
                             })),
-                    )
+                    );
+                rise(ElementId::NamedInteger("toast".into(), ix as u64), pill)
             });
         let update = self.update.clone().map(|(message, url)| {
-            pill(h_flex())
+            let pill = pill(h_flex())
                 .child(message)
                 .child(
                     Button::new("get-update")
@@ -1257,7 +1289,8 @@ impl Workspace {
                             this.update = None;
                             cx.notify();
                         })),
-                )
+                );
+            rise("update-toast".into(), pill)
         });
         v_flex()
             .absolute()
@@ -1314,9 +1347,21 @@ impl Render for Workspace {
         } else {
             sidebar_bg
         };
+        let open = self.sidebar_open;
         div()
             .size_full()
             .relative()
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &NewThread, _, cx| {
+                let project = if this.chat { None } else { this.project_filter };
+                this.new_thread(project, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                this.sidebar_open = true;
+                let search = this.editors.search.read(cx).focus_handle(cx);
+                window.focus(&search, cx);
+                cx.notify();
+            }))
             .bg(if prefs.glass && !wallpaper {
                 background.opacity(0.8)
             } else {
@@ -1331,26 +1376,38 @@ impl Render for Workspace {
                     background,
                 ))
             })
-            .when(self.sidebar_open, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .bottom_0()
-                        .w(px(SIDEBAR))
-                        .bg(sidebar_fill)
-                        .border_r_1()
-                        .border_color(foreground.opacity(0.07)),
-                )
-            })
+            // The panel and its contents ride one spring, so a toggle mid-slide
+            // turns around from where it is instead of jumping.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .bottom_0()
+                    .bg(sidebar_fill)
+                    .border_r_1()
+                    .border_color(foreground.opacity(0.07))
+                    .with_spring("sidebar-panel", sidebar_spring(open), |el, w| {
+                        el.w(w).opacity((w / px(SIDEBAR)).clamp(0., 1.))
+                    }),
+            )
             .child(
                 v_flex().relative().size_full().child(titlebar).child(
                     h_flex()
                         .flex_1()
                         .min_h_0()
                         .items_start()
-                        .when(self.sidebar_open, |el| el.child(sidebar))
+                        .child(
+                            div()
+                                .h_full()
+                                .flex_shrink_0()
+                                .overflow_hidden()
+                                .child(div().w(px(SIDEBAR)).h_full().child(sidebar))
+                                .with_spring("sidebar-body", sidebar_spring(open), |el, w| {
+                                    let shown = (w / px(SIDEBAR)).clamp(0., 1.);
+                                    el.w(w).opacity(shown)
+                                }),
+                        )
                         .child(div().flex_1().min_w_0().h_full().child(main)),
                 ),
             )

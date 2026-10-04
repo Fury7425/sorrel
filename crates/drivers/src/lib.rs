@@ -182,3 +182,72 @@ pub(crate) fn clip(s: &str, max: usize) -> String {
     }
     format!("{}…", &s[..end])
 }
+
+pub(crate) fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Unix seconds for an RFC 3339 time such as `2026-10-04T16:10:00.07+00:00`;
+/// 0 when it does not parse.
+pub(crate) fn unix_from_rfc3339(s: &str) -> i64 {
+    let parse = || -> Option<i64> {
+        let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+        let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+        let (hh, mm, ss) = (num(11..13)?, num(14..16)?, num(17..19)?);
+        // Days from the civil date (Howard Hinnant's algorithm).
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        // The offset sits after the seconds and any fraction: `Z` or `±hh:mm`.
+        let rest = &s[19..];
+        let offset = match rest.find(['+', '-']) {
+            Some(at) => {
+                let sign = if rest.as_bytes()[at] == b'-' { -1 } else { 1 };
+                let h: i64 = rest.get(at + 1..at + 3)?.parse().ok()?;
+                let m: i64 = rest.get(at + 4..at + 6)?.parse().ok()?;
+                sign * (h * 3600 + m * 60)
+            }
+            None => 0,
+        };
+        Some(days * 86_400 + hh * 3600 + mm * 60 + ss - offset)
+    };
+    parse().unwrap_or(0)
+}
+
+/// Lines prefixed for a unified-diff view, at most `max` of them.
+pub(crate) fn diff_lines(out: &mut Vec<String>, prefix: char, text: &str, max: usize) {
+    for line in text.lines() {
+        if out.len() == max {
+            out.push("…".into());
+            return;
+        }
+        if out.last().is_some_and(|l| l == "…") {
+            return;
+        }
+        out.push(format!("{prefix}{line}"));
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+
+    #[test]
+    fn rfc3339_and_waits() {
+        assert_eq!(unix_from_rfc3339("1970-01-01T00:00:00Z"), 0);
+        assert_eq!(
+            unix_from_rfc3339("2026-10-04T16:10:00.070723+00:00"),
+            1_791_130_200
+        );
+        assert_eq!(unix_from_rfc3339("2026-10-05T01:10:00+09:00"), 1_791_130_200);
+        assert_eq!(unix_from_rfc3339("nonsense"), 0);
+        assert_eq!(proto::wait_text(59), "1m");
+        assert_eq!(proto::wait_text(3 * 3600 + 600), "3h 10m");
+        assert_eq!(proto::wait_text(2 * 86_400 + 4 * 3600), "2d 4h");
+    }
+}

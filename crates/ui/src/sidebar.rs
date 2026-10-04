@@ -28,6 +28,7 @@ impl Workspace {
             theme.sidebar,
             theme.primary,
         );
+        let mono = theme.mono_font_family.clone();
         let chat = self.chat;
         let query = self.editors.search.read(cx).value().trim().to_lowercase();
 
@@ -62,7 +63,8 @@ impl Workspace {
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(Icon::new(IconName::Plus).small())
-                        .child("New chat")
+                        .child(div().flex_1().child("New chat"))
+                        .child(style::kbd("N", mono.clone(), primary.opacity(0.8)).border_0())
                         .on_click(cx.listener(|this, _, _, cx| this.new_thread(None, cx))),
                 )
                 .into_any_element()
@@ -99,7 +101,8 @@ impl Workspace {
 
         let search = Input::new(&self.editors.search)
             .small()
-            .prefix(Icon::new(IconName::Search).small().text_color(muted));
+            .prefix(Icon::new(IconName::Search).small().text_color(muted))
+            .suffix(style::kbd("K", mono, muted.opacity(0.8)));
 
         let mut visible: Vec<&ThreadInfo> = self
             .threads

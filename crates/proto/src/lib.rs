@@ -140,6 +140,9 @@ pub struct ModelInfo {
     pub description: String,
     /// Reasoning efforts the model accepts, if the CLI says.
     pub efforts: Vec<String>,
+    /// Claude's fast mode works with this model.
+    #[serde(default)]
+    pub fast: bool,
 }
 
 /// What a message sent during a running turn does.
@@ -213,6 +216,18 @@ pub enum StopReason {
     Timeout,
 }
 
+/// One usage-limit window of a subscription, such as the 5-hour session or
+/// the week.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LimitWindow {
+    /// "Session", "Weekly", "Monthly".
+    pub label: String,
+    /// Percent of the window used, 0 to 100.
+    pub used: f32,
+    /// Unix seconds; 0 when the CLI did not say.
+    pub resets_at: i64,
+}
+
 /// What every driver emits, whatever CLI is behind it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AgentEvent {
@@ -228,10 +243,14 @@ pub enum AgentEvent {
         msg_id: MsgId,
         text: String,
     },
+    /// `detail` is what the call will change, as a unified diff for edits or
+    /// the new text for a written file; empty when there is nothing to show.
     ToolCall {
         call_id: String,
         kind: ToolKind,
         title: String,
+        #[serde(default)]
+        detail: String,
     },
     /// `preview` is the first lines of the output; the rest lives in `output`.
     ToolUpdate {
@@ -258,6 +277,16 @@ pub enum AgentEvent {
     Usage {
         input: u64,
         output: u64,
+    },
+    /// How full the context window is after the latest model call.
+    Context {
+        used: u64,
+        window: u64,
+    },
+    /// The subscription's usage limits as the CLI last reported them. Not
+    /// logged; the engine keeps the latest per CLI.
+    Limits {
+        windows: Vec<LimitWindow>,
     },
     TurnEnded {
         reason: StopReason,
@@ -305,6 +334,8 @@ impl ThreadEvent {
                 AgentEvent::SessionStarted { .. }
                     | AgentEvent::ToolUpdate { .. }
                     | AgentEvent::Usage { .. }
+                    | AgentEvent::Context { .. }
+                    | AgentEvent::Limits { .. }
                     | AgentEvent::Commands { .. }
             ),
         }
@@ -330,6 +361,7 @@ pub enum Item {
         call_id: String,
         kind: ToolKind,
         title: String,
+        detail: String,
         status: ToolStatus,
         preview: String,
         output: Option<BlobRef>,
@@ -370,6 +402,8 @@ pub struct Transcript {
     pub items: Vec<Item>,
     /// Turns started so far (the first turn is 1).
     pub turn: u32,
+    /// Context tokens in use and the window's size, as last reported.
+    pub context: Option<(u64, u64)>,
     usage: (u64, u64),
     todo: Option<usize>,
 }
@@ -421,7 +455,13 @@ impl Transcript {
 
     fn apply_agent(&mut self, event: &AgentEvent) -> Option<usize> {
         match event {
-            AgentEvent::SessionStarted { .. } | AgentEvent::Commands { .. } => None,
+            AgentEvent::SessionStarted { .. }
+            | AgentEvent::Commands { .. }
+            | AgentEvent::Limits { .. } => None,
+            AgentEvent::Context { used, window } => {
+                self.context = Some((*used, *window));
+                None
+            }
             AgentEvent::TextDelta { msg_id, text } => {
                 if let Some(Item::Assistant {
                     msg_id: id,
@@ -456,10 +496,12 @@ impl Transcript {
                 call_id,
                 kind,
                 title,
+                detail,
             } => self.push(Item::Tool {
                 call_id: call_id.clone(),
                 kind: *kind,
                 title: title.clone(),
+                detail: detail.clone(),
                 status: ToolStatus::Running,
                 preview: String::new(),
                 output: None,
@@ -569,7 +611,8 @@ pub struct ThreadInfo {
     pub running: bool,
     /// A permission request or question is waiting on the user.
     pub needs_input: bool,
-    pub queued: usize,
+    /// Messages waiting for the running turn to end, in order.
+    pub queue: Vec<String>,
     pub updated_at: i64,
     pub pinned: bool,
     pub archived: bool,
@@ -876,6 +919,16 @@ pub enum Request {
     Interrupt {
         thread: ThreadId,
     },
+    /// Drops a queued message.
+    Unqueue {
+        thread: ThreadId,
+        index: usize,
+    },
+    /// Folds a queued message into the running turn now.
+    SteerQueued {
+        thread: ThreadId,
+        index: usize,
+    },
     Resolve {
         thread: ThreadId,
         req_id: String,
@@ -1014,11 +1067,29 @@ pub enum Update {
         provider: Provider,
         names: Vec<String>,
     },
+    /// A CLI's subscription usage limits.
+    Limits {
+        provider: Provider,
+        windows: Vec<LimitWindow>,
+    },
     /// A newer release exists; `url` is its download page.
     UpdateAvailable {
         version: String,
         url: String,
     },
+}
+
+/// A wait such as "3h 10m", "45m" or "2d 4h".
+pub fn wait_text(secs: i64) -> String {
+    let minutes = (secs.max(0) + 59) / 60;
+    let (days, hours, mins) = (minutes / 1440, minutes / 60 % 24, minutes % 60);
+    match (days, hours, mins) {
+        (0, 0, m) => format!("{m}m"),
+        (0, h, 0) => format!("{h}h"),
+        (0, h, m) => format!("{h}h {m}m"),
+        (d, 0, _) => format!("{d}d"),
+        (d, h, _) => format!("{d}d {h}h"),
+    }
 }
 
 #[cfg(test)]
@@ -1057,6 +1128,7 @@ mod tests {
                 call_id: "t1".into(),
                 kind: ToolKind::Execute,
                 title: "ls".into(),
+                detail: String::new(),
             }),
             todo(TodoStatus::Pending),
             agent(AgentEvent::ToolUpdate {

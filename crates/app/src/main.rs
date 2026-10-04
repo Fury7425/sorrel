@@ -35,7 +35,7 @@ use ui::{Connection, Workspace};
 /// Lucide icons the UI uses beyond gpui-kit's default set (ISC license, see
 /// `assets/icons/LICENSE-LUCIDE`) and Sorrel's own provider marks, served in
 /// front of the default assets.
-const EXTRA_ICONS: [(&str, &[u8]); 17] = [
+const EXTRA_ICONS: [(&str, &[u8]); 18] = [
     (
         "icons/monitor.svg",
         include_bytes!("../assets/icons/monitor.svg"),
@@ -85,6 +85,10 @@ const EXTRA_ICONS: [(&str, &[u8]); 17] = [
         include_bytes!("../assets/icons/layout-grid.svg"),
     ),
     ("icons/lock.svg", include_bytes!("../assets/icons/lock.svg")),
+    (
+        "icons/paperclip.svg",
+        include_bytes!("../assets/icons/paperclip.svg"),
+    ),
     ("icons/plug.svg", include_bytes!("../assets/icons/plug.svg")),
     (
         "icons/sliders-horizontal.svg",
@@ -262,7 +266,7 @@ fn replay(
             folder: PathBuf::new(),
             running: true,
             needs_input: false,
-            queued: 0,
+            queue: Vec::new(),
             updated_at: 0,
             pinned: false,
             archived: false,

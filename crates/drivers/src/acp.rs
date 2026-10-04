@@ -417,6 +417,7 @@ pub fn translate(update: &Value, msg_id: &str, blob_dir: &Path, out: &mut Vec<Ag
                 call_id: string(&update["toolCallId"]),
                 kind: tool_kind(update["kind"].as_str().unwrap_or_default()),
                 title: clip(&string(&update["title"]), 200),
+                detail: diff_detail(&update["content"]),
             });
             tool_update(update, blob_dir, out);
         }
@@ -439,6 +440,24 @@ pub fn translate(update: &Value, msg_id: &str, blob_dir: &Path, out: &mut Vec<Ag
         }),
         _ => {}
     }
+}
+
+/// The `diff` parts of a tool call's content, as diff lines.
+fn diff_detail(content: &Value) -> String {
+    let mut lines = Vec::new();
+    for part in content.as_array().map(Vec::as_slice).unwrap_or_default() {
+        if part["type"] != "diff" {
+            continue;
+        }
+        if !lines.is_empty() {
+            lines.push("@@".to_owned());
+        }
+        let text = |key: &str| part[key].as_str().unwrap_or_default().to_owned();
+        crate::diff_lines(&mut lines, '-', &text("oldText"), 160);
+        crate::diff_lines(&mut lines, '+', &text("newText"), 160);
+    }
+    lines.join("
+")
 }
 
 fn tool_update(update: &Value, blob_dir: &Path, out: &mut Vec<AgentEvent>) {

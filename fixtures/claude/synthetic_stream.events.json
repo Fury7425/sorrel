@@ -1,5 +1,6 @@
 [
 {"SessionStarted":{"session_id":"00000000-0000-4000-8000-000000000001","model":"claude-opus-5-5"}},
+{"Context":{"used":10203,"window":200000}},
 {"ThinkingDelta":{"msg_id":"msg_synthetic_01","text":"The "}},
 {"ThinkingDelta":{"msg_id":"msg_synthetic_01","text":"user wants"}},
 {"ThinkingDelta":{"msg_id":"msg_synthetic_01","text":" a lon"}},
