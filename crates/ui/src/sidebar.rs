@@ -1,5 +1,6 @@
 //! The sidebar: the Chat/Code switch, then sessions (Code) or chats (Chat),
 //! with search, a project filter, pins, a right-click menu and the footer.
+//! Laid out after the mockup's `Sidebar` and `ChatSidebar` artboards.
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::{
@@ -21,45 +22,85 @@ use crate::{Section, View, Workspace};
 impl Workspace {
     pub(crate) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let (fg, muted, sidebar) = (theme.foreground, theme.muted_foreground, theme.sidebar);
+        let (fg, muted, sidebar, primary) = (
+            theme.foreground,
+            theme.muted_foreground,
+            theme.sidebar,
+            theme.primary,
+        );
         let see_through = self.prefs().glass || !self.prefs().wallpaper.is_empty();
         let chat = self.chat;
         let query = self.editors.search.read(cx).value().trim().to_lowercase();
 
-        let side = h_flex()
-            .p_0p5()
+        let switch = h_flex()
+            .p(px(3.))
             .rounded_lg()
-            .bg(fg.opacity(0.06))
+            .bg(black().opacity(0.28))
             .border_1()
             .border_color(fg.opacity(0.07))
             .child(
-                Button::new("side-chat")
-                    .ghost()
-                    .small()
-                    .flex_1()
-                    .label("Chat")
-                    .selected(chat)
+                side_button("side-chat", "Chat", chat, cx)
                     .on_click(cx.listener(|this, _, _, cx| this.switch_side(true, cx))),
             )
             .child(
-                Button::new("side-code")
-                    .ghost()
-                    .small()
-                    .flex_1()
-                    .label("Code")
-                    .selected(!chat)
+                side_button("side-code", "Code", !chat, cx)
                     .on_click(cx.listener(|this, _, _, cx| this.switch_side(false, cx))),
             );
 
-        let new_button = Button::new("new-thread")
-            .primary()
-            .small()
-            .w_full()
-            .icon(IconName::Plus)
-            .label(if chat { "New chat" } else { "New thread" })
-            .on_click(cx.listener(|this, _, _, cx| this.new_thread(None, cx)));
+        let head = if chat {
+            v_flex()
+                .gap_0p5()
+                .child(
+                    h_flex()
+                        .id("new-chat")
+                        .gap_2p5()
+                        .h(px(34.))
+                        .px_2p5()
+                        .rounded_lg()
+                        .cursor_pointer()
+                        .bg(primary.opacity(0.16))
+                        .text_color(primary.opacity(0.95))
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(Icon::new(IconName::Plus).small())
+                        .child("New chat")
+                        .on_click(cx.listener(|this, _, _, cx| this.new_thread(None, cx))),
+                )
+                .into_any_element()
+        } else {
+            h_flex()
+                .gap_0p5()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(self.render_project_filter(cx)),
+                )
+                .child(
+                    Button::new("new-thread")
+                        .ghost()
+                        .xsmall()
+                        .icon(Lucide::SquarePen)
+                        .tooltip("New thread")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let project = this.project_filter;
+                            this.new_thread(project, cx)
+                        })),
+                )
+                .child(
+                    Button::new("add-project")
+                        .ghost()
+                        .xsmall()
+                        .icon(Lucide::FolderPlus)
+                        .tooltip("Add project")
+                        .on_click(cx.listener(|this, _, _, cx| this.open_palette(cx))),
+                )
+                .into_any_element()
+        };
 
-        let filter = (!chat).then(|| self.render_project_filter(cx));
+        let search = Input::new(&self.editors.search)
+            .small()
+            .prefix(Icon::new(IconName::Search).small().text_color(muted));
 
         let mut visible: Vec<&ThreadInfo> = self
             .threads
@@ -71,17 +112,16 @@ impl Workspace {
         visible.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
         let stamp = now();
         let (pinned, rest): (Vec<_>, Vec<_>) = visible.into_iter().partition(|t| t.pinned);
+        let (today, rest): (Vec<_>, Vec<_>) = rest
+            .into_iter()
+            .partition(|t| stamp - t.updated_at < 86_400);
+        let (week, older): (Vec<_>, Vec<_>) = rest
+            .into_iter()
+            .partition(|t| stamp - t.updated_at < 7 * 86_400);
 
-        let mut list = v_flex()
-            .id("sidebar-list")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .gap_0p5()
-            .px_2();
         let label = |text: &'static str| {
             div()
-                .px_2()
+                .px_2p5()
                 .pt_3()
                 .pb_1()
                 .text_xs()
@@ -89,37 +129,42 @@ impl Workspace {
                 .text_color(muted)
                 .child(text)
         };
-        if !pinned.is_empty() {
-            list = list.child(label("PINNED"));
-            for thread in &pinned {
-                list = list.child(self.render_card(thread, stamp, cx));
+        let mut list = v_flex()
+            .id("sidebar-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .gap_0p5()
+            .px_2();
+        let groups: [(&'static str, &Vec<&ThreadInfo>); 4] = [
+            ("PINNED", &pinned),
+            ("TODAY", &today),
+            ("PREVIOUS 7 DAYS", &week),
+            ("OLDER", &older),
+        ];
+        let mut any = false;
+        for (name, threads) in groups {
+            if threads.is_empty() {
+                continue;
             }
-        }
-        let (today, earlier): (Vec<_>, Vec<_>) = rest
-            .into_iter()
-            .partition(|t| stamp - t.updated_at < 86_400);
-        if !today.is_empty() {
-            list = list.child(label("TODAY"));
-            for thread in &today {
-                list = list.child(self.render_card(thread, stamp, cx));
-            }
-        }
-        if !earlier.is_empty() {
-            list = list.child(label("EARLIER"));
-            for thread in &earlier {
-                list = list.child(self.render_card(thread, stamp, cx));
-            }
-        }
-        if pinned.is_empty() && today.is_empty() && earlier.is_empty() {
-            list = list.child(div().px_2().pt_6().text_sm().text_color(muted).child(
-                if query.is_empty() {
-                    if chat {
-                        "No chats yet."
-                    } else {
-                        "No sessions yet."
-                    }
+            any = true;
+            list = list.child(label(name));
+            for thread in threads {
+                list = list.child(if chat {
+                    self.render_chat_row(thread, cx)
                 } else {
+                    self.render_card(thread, stamp, cx)
+                });
+            }
+        }
+        if !any {
+            list = list.child(div().px_2p5().pt_6().text_sm().text_color(muted).child(
+                if !query.is_empty() {
                     "Nothing matches."
+                } else if chat {
+                    "No chats yet."
+                } else {
+                    "No sessions yet."
                 },
             ));
         }
@@ -130,17 +175,29 @@ impl Workspace {
             .filter(|t| t.archived && t.chat == chat)
             .count();
         let footer = v_flex()
-            .gap_1()
-            .p_2()
+            .gap_1p5()
+            .px_2p5()
+            .pt_2()
+            .pb_2p5()
             .when(archived > 0, |el| {
                 el.child(
-                    Button::new("archived")
-                        .ghost()
-                        .small()
-                        .w_full()
-                        .justify_start()
-                        .icon(Lucide::Archive)
-                        .label(format!("Archived ({archived})"))
+                    h_flex()
+                        .id("archived")
+                        .gap_2()
+                        .h(px(30.))
+                        .px_2p5()
+                        .rounded_lg()
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(muted)
+                        .hover(move |s| s.bg(fg.opacity(0.05)))
+                        .child(Icon::new(Lucide::Archive).small())
+                        .child(div().flex_1().child(if chat {
+                            "Archived chats"
+                        } else {
+                            "Archived sessions"
+                        }))
+                        .child(archived.to_string())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.view = View::Settings(Section::Archived);
                             cx.notify();
@@ -150,9 +207,9 @@ impl Workspace {
             .child(
                 h_flex()
                     .gap_1()
+                    .h(px(36.))
                     .pl_2p5()
                     .pr_1()
-                    .py_1()
                     .rounded_lg()
                     .bg(fg.opacity(0.04))
                     .border_1()
@@ -173,6 +230,7 @@ impl Workspace {
                     .child(
                         div()
                             .flex_1()
+                            .pl_1()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
                             .child("Local"),
@@ -210,7 +268,7 @@ impl Workspace {
             .h_full()
             .flex_shrink_0()
             .bg(if see_through {
-                sidebar.opacity(0.55)
+                sidebar.opacity(0.58)
             } else {
                 sidebar
             })
@@ -219,36 +277,12 @@ impl Workspace {
             .child(
                 v_flex()
                     .gap_2()
-                    .px_3()
+                    .px_2p5()
                     .pt_1()
-                    .pb_2()
-                    .child(side)
-                    .child(new_button),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .px_3()
                     .pb_1()
-                    .children(filter)
-                    .child(div().flex_1())
-                    .when(!chat, |el| {
-                        el.child(
-                            Button::new("add-project")
-                                .ghost()
-                                .xsmall()
-                                .icon(Lucide::FolderPlus)
-                                .tooltip("Add project")
-                                .on_click(cx.listener(|this, _, _, cx| this.open_palette(cx))),
-                        )
-                    }),
-            )
-            .child(
-                div().px_3().pb_1().child(
-                    Input::new(&self.editors.search)
-                        .small()
-                        .prefix(Icon::new(IconName::Search).small()),
-                ),
+                    .child(switch)
+                    .child(head)
+                    .child(search),
             )
             .child(list)
             .child(footer)
@@ -275,7 +309,7 @@ impl Workspace {
                     .cursor_pointer()
                     .when(id == current, |el| el.bg(fg.opacity(0.08)))
                     .hover(move |style| style.bg(fg.opacity(0.06)))
-                    .child(Icon::new(Lucide::Folder).small())
+                    .child(Icon::new(IconName::Folder).small())
                     .child(div().flex_1().text_sm().child(name))
                     .when_some(id, |el, id| {
                         el.child(
@@ -306,11 +340,14 @@ impl Workspace {
                 cx.notify();
             }))
             .trigger(
-                Button::new("filter-trigger")
-                    .ghost()
-                    .small()
-                    .icon(Lucide::Folder)
-                    .label(label),
+                Button::new("filter-trigger").ghost().small().child(
+                    h_flex()
+                        .gap_2()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(Icon::new(IconName::Folder).small())
+                        .child(label)
+                        .child(Icon::new(IconName::ChevronDown).xsmall()),
+                ),
             )
             .w(px(240.))
             .p_1()
@@ -318,6 +355,7 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// A Code session: provider dot and title, then project and status.
     fn render_card(&self, thread: &ThreadInfo, now: i64, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let (fg, muted, primary, warning, danger) = (
@@ -341,29 +379,8 @@ impl Workspace {
         let project = thread
             .project
             .and_then(|p| self.projects.iter().find(|x| x.id == p))
-            .map(|p| p.name.clone());
-        let renaming = self.renaming == Some(id);
-        let title: AnyElement = if renaming {
-            Input::new(&self.editors.rename).xsmall().into_any_element()
-        } else {
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_sm()
-                .font_weight(FontWeight::MEDIUM)
-                .child(thread.title.clone())
-                .into_any_element()
-        };
-
-        let (requests, weak, pinned, chat) = (
-            self.requests.clone(),
-            cx.entity().downgrade(),
-            thread.pinned,
-            thread.chat,
-        );
-        let has_project = thread.project;
-        v_flex()
+            .map_or("No project".to_owned(), |p| p.name.clone());
+        let card = v_flex()
             .id(("thread", id as u64))
             .gap_1()
             .px_2p5()
@@ -380,39 +397,101 @@ impl Workspace {
                 h_flex()
                     .gap_2()
                     .child(provider_dot(thread.provider, 7.))
-                    .child(title),
+                    .child(self.title(thread, cx)),
             )
-            .when(!chat || color.is_some(), |el| {
-                el.child(
-                    h_flex()
-                        .gap_1p5()
-                        .pl(px(15.))
-                        .text_xs()
-                        .text_color(muted)
-                        .child(div().flex_1().truncate().child(project.unwrap_or_else(|| {
-                            if chat {
-                                String::new()
-                            } else {
-                                "No project".into()
-                            }
-                        })))
-                        .when(thread.running && !thread.needs_input, |el| {
-                            el.child(style::thinking_orb(("card-orb", id as u64), 10., primary))
-                        })
-                        .child(
-                            div()
-                                .px_1p5()
-                                .rounded_md()
-                                .when_some(color, |el, c| {
-                                    el.bg(c.opacity(0.14))
-                                        .text_color(c)
-                                        .font_weight(FontWeight::MEDIUM)
-                                })
-                                .child(status),
-                        ),
-                )
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .pl(px(15.))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(div().flex_1().min_w_0().truncate().child(project))
+                    .when(thread.running && !thread.needs_input, |el| {
+                        el.child(style::thinking_orb(("card-orb", id as u64), 10., primary))
+                    })
+                    .child(
+                        div()
+                            .px_1p5()
+                            .rounded_md()
+                            .when_some(color, |el, c| {
+                                el.bg(c.opacity(0.14))
+                                    .text_color(c)
+                                    .font_weight(FontWeight::MEDIUM)
+                            })
+                            .child(status),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| this.open_thread(id, window, cx)));
+        self.with_menu(card, thread, cx)
+    }
+
+    /// A chat: one line with its title, like the mockup's chat list.
+    fn render_chat_row(&self, thread: &ThreadInfo, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (fg, muted, primary) = (theme.foreground, theme.muted_foreground, theme.primary);
+        let id = thread.id;
+        let selected = self.view == View::Thread(id);
+        let row = h_flex()
+            .id(("chat", id as u64))
+            .gap_2()
+            .h(px(32.))
+            .px_2p5()
+            .rounded_lg()
+            .cursor_pointer()
+            .when(selected, |el| {
+                el.bg(fg.opacity(0.09))
+                    .border_1()
+                    .border_color(fg.opacity(0.07))
             })
-            .on_click(cx.listener(move |this, _, window, cx| this.open_thread(id, window, cx)))
+            .when(!selected, |el| {
+                el.text_color(muted.opacity(0.95))
+                    .hover(move |s| s.bg(fg.opacity(0.05)))
+            })
+            .child(self.title(thread, cx))
+            .when(thread.running, |el| {
+                el.child(style::thinking_orb(
+                    ("chat-row-orb", id as u64),
+                    10.,
+                    primary,
+                ))
+            })
+            .on_click(cx.listener(move |this, _, window, cx| this.open_thread(id, window, cx)));
+        self.with_menu(row, thread, cx)
+    }
+
+    /// The title, or the rename field while renaming.
+    fn title(&self, thread: &ThreadInfo, _: &mut Context<Self>) -> AnyElement {
+        if self.renaming == Some(thread.id) {
+            return div()
+                .flex_1()
+                .child(Input::new(&self.editors.rename).xsmall())
+                .into_any_element();
+        }
+        div()
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .text_sm()
+            .font_weight(FontWeight::MEDIUM)
+            .child(thread.title.clone())
+            .into_any_element()
+    }
+
+    /// Pin, rename, project settings, archive and delete on right-click.
+    fn with_menu(
+        &self,
+        element: Stateful<Div>,
+        thread: &ThreadInfo,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (requests, weak, pinned, id, project) = (
+            self.requests.clone(),
+            cx.entity().downgrade(),
+            thread.pinned,
+            thread.id,
+            thread.project,
+        );
+        element
             .context_menu(move |menu, _, _| {
                 let (r1, r2, r3) = (requests.clone(), requests.clone(), requests.clone());
                 let (w1, w2) = (weak.clone(), weak.clone());
@@ -426,7 +505,7 @@ impl Workspace {
                 .item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
                     let _ = w1.update(cx, |this, cx| this.start_rename(id, window, cx));
                 }))
-                .when_some(has_project, |menu, project| {
+                .when_some(project, |menu, project| {
                     menu.item(PopupMenuItem::new("Project settings").on_click(
                         move |_, window, cx| {
                             let _ =
@@ -458,6 +537,22 @@ impl Workspace {
         self.renaming = Some(id);
         cx.notify();
     }
+}
+
+/// One half of the Chat/Code switch.
+fn side_button(id: &'static str, label: &'static str, on: bool, cx: &App) -> Button {
+    let theme = cx.theme();
+    Button::new(id)
+        .ghost()
+        .small()
+        .flex_1()
+        .label(label)
+        .selected(on)
+        .when(on, |b| {
+            b.bg(theme.foreground.opacity(0.12))
+                .text_color(theme.foreground)
+        })
+        .when(!on, |b| b.text_color(theme.muted_foreground))
 }
 
 pub(crate) fn now() -> i64 {

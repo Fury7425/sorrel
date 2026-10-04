@@ -59,6 +59,35 @@ pub fn provider_color(provider: Provider) -> Hsla {
     .into()
 }
 
+/// The provider's mark in its color. These are Sorrel's own abstract marks,
+/// not the vendors' logos.
+pub fn provider_icon(provider: Provider, size: f32) -> Svg {
+    svg()
+        .path(match provider {
+            Provider::Claude => "icons/provider-claude.svg",
+            Provider::Codex => "icons/provider-codex.svg",
+            Provider::Cursor => "icons/provider-cursor.svg",
+            Provider::Gemini => "icons/provider-gemini.svg",
+            Provider::OpenCode => "icons/provider-opencode.svg",
+        })
+        .size(px(size))
+        .flex_shrink_0()
+        .text_color(provider_color(provider))
+}
+
+/// The mark on a tinted rounded square, for lists and avatars.
+pub fn provider_tile(provider: Provider, size: f32) -> Div {
+    div()
+        .size(px(size))
+        .flex_shrink_0()
+        .rounded(px(size * 0.28))
+        .bg(provider_color(provider).opacity(0.16))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(provider_icon(provider, size * 0.6))
+}
+
 /// A small filled circle in the provider's color.
 pub fn provider_dot(provider: Provider, size: f32) -> Div {
     div()

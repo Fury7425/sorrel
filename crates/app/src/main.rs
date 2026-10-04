@@ -33,8 +33,37 @@ use tokio::{
 use ui::{Connection, Workspace};
 
 /// Lucide icons the UI uses beyond gpui-kit's default set (ISC license, see
-/// `assets/icons/LICENSE-LUCIDE`), served in front of the default assets.
-const EXTRA_ICONS: [(&str, &[u8]); 10] = [
+/// `assets/icons/LICENSE-LUCIDE`) and Sorrel's own provider marks, served in
+/// front of the default assets.
+const EXTRA_ICONS: [(&str, &[u8]); 17] = [
+    (
+        "icons/monitor.svg",
+        include_bytes!("../assets/icons/monitor.svg"),
+    ),
+    (
+        "icons/provider-claude.svg",
+        include_bytes!("../assets/icons/provider-claude.svg"),
+    ),
+    (
+        "icons/provider-codex.svg",
+        include_bytes!("../assets/icons/provider-codex.svg"),
+    ),
+    (
+        "icons/provider-cursor.svg",
+        include_bytes!("../assets/icons/provider-cursor.svg"),
+    ),
+    (
+        "icons/provider-gemini.svg",
+        include_bytes!("../assets/icons/provider-gemini.svg"),
+    ),
+    (
+        "icons/provider-opencode.svg",
+        include_bytes!("../assets/icons/provider-opencode.svg"),
+    ),
+    (
+        "icons/square-pen.svg",
+        include_bytes!("../assets/icons/square-pen.svg"),
+    ),
     (
         "icons/archive.svg",
         include_bytes!("../assets/icons/archive.svg"),

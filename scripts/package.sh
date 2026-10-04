@@ -22,8 +22,9 @@ case "$(uname -s)" in
     ;;
   Darwin)
     app=dist/Sorrel.app
-    mkdir -p "$app/Contents/MacOS"
+    mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
     cp target/release/sorrel "$app/Contents/MacOS/sorrel"
+    cp crates/app/icon/sorrel.icns "$app/Contents/Resources/sorrel.icns"
     cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -31,6 +32,7 @@ case "$(uname -s)" in
   <key>CFBundleName</key><string>Sorrel</string>
   <key>CFBundleIdentifier</key><string>app.sorrel.desktop</string>
   <key>CFBundleExecutable</key><string>sorrel</string>
+  <key>CFBundleIconFile</key><string>sorrel</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
   <key>CFBundleVersion</key><string>$version</string>
   <key>CFBundlePackageType</key><string>APPL</string>
@@ -62,11 +64,13 @@ PLIST
     stage="dist/sorrel-$version-linux-x64"
     mkdir -p "$stage"
     cp target/release/sorrel "$stage/"
+    cp crates/app/icon/sorrel.png "$stage/sorrel.png"
     cat > "$stage/sorrel.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Sorrel
 Exec=sorrel
+Icon=sorrel
 Categories=Development;Utility;
 DESKTOP
     tar -C dist -czf "$stage.tar.gz" "$(basename "$stage")"

@@ -116,6 +116,10 @@ pub struct Workspace {
     chat_draft: Entity<ThreadView>,
     project_filter: Option<ProjectId>,
     filter_open: bool,
+    /// The settings dropdown that is open, by id.
+    open_select: Option<&'static str>,
+    /// The Providers page shows the new-variable row.
+    env_adding: bool,
     palette: Option<Palette>,
     dir: (String, Vec<String>),
     /// The provider open on the Providers page.
@@ -216,7 +220,29 @@ impl Workspace {
             path: input("~/", window, cx),
             new_project: input("Project name", window, cx),
         };
-        let _subscriptions = vec![
+        let mut _subscriptions = Vec::new();
+        // Provider fields save on Enter (keys) and on Enter or leaving the field (runtime).
+        for (provider, state) in &editors.keys {
+            let provider = *provider;
+            _subscriptions.push(cx.subscribe_in(
+                state,
+                window,
+                move |this, _, event, window, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        this.save_key(provider, window, cx);
+                    }
+                },
+            ));
+        }
+        for (provider, state) in editors.binaries.iter().chain(&editors.args) {
+            let provider = *provider;
+            _subscriptions.push(cx.subscribe(state, move |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    this.save_runtime(provider, cx);
+                }
+            }));
+        }
+        _subscriptions.extend([
             cx.subscribe(&editors.search, |_, _, event: &InputEvent, cx| {
                 if let InputEvent::Change = event {
                     cx.notify();
@@ -233,7 +259,7 @@ impl Workspace {
                     this.request(Request::ListDir { path });
                 }
             }),
-        ];
+        ]);
 
         let code_draft = cx.new(|cx| {
             ThreadView::draft(
@@ -273,6 +299,8 @@ impl Workspace {
             chat_draft,
             project_filter: None,
             filter_open: false,
+            open_select: None,
+            env_adding: false,
             palette: None,
             dir: (String::new(), Vec::new()),
             provider_page: Provider::Claude,

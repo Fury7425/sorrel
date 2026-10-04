@@ -6367,6 +6367,7 @@ name = "sorrel"
 version = "0.1.0"
 dependencies = [
  "drivers",
+ "embed-resource",
  "engine",
  "gpui-kit",
  "proto",

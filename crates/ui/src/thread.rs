@@ -34,7 +34,7 @@ use proto::{
 };
 use tokio::sync::mpsc;
 
-use crate::style::{self, provider_color, provider_dot, segment, segmented, ultra_hue};
+use crate::style::{self, provider_icon, provider_tile, segment, segmented, ultra_hue};
 
 /// Width of the timeline and composer column.
 const COLUMN: f32 = 780.;
@@ -169,8 +169,11 @@ impl ThreadView {
                 &composer,
                 window,
                 |this, _, event, window, cx| match event {
-                    InputEvent::PressEnter { shift: false, .. } => {
-                        let delivery = if this.look.enter_steers {
+                    InputEvent::PressEnter {
+                        shift: false,
+                        secondary,
+                    } => {
+                        let delivery = if this.look.enter_steers != *secondary {
                             Delivery::SteerNow
                         } else {
                             Delivery::Queue
@@ -698,14 +701,7 @@ impl ThreadView {
                         .child(
                             div()
                                 .mt_0p5()
-                                .size(px(26.))
-                                .flex_shrink_0()
-                                .rounded_full()
-                                .bg(provider_color(provider).opacity(0.16))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(provider_dot(provider, 9.)),
+                                .child(provider_tile(provider, 26.).rounded_full()),
                         )
                         .child(div().flex_1().min_w_0().child(body))
                         .into_any_element()
@@ -1373,7 +1369,7 @@ impl ThreadView {
         let trigger = Button::new("model-trigger").ghost().small().child(
             h_flex()
                 .gap_1p5()
-                .child(provider_dot(provider, 8.))
+                .child(provider_icon(provider, 14.))
                 .child(
                     div()
                         .font_weight(FontWeight::SEMIBOLD)
@@ -1453,7 +1449,7 @@ impl ThreadView {
 
         let header = h_flex()
             .gap_2p5()
-            .child(provider_dot(provider, 10.))
+            .child(provider_icon(provider, 20.))
             .child(
                 v_flex().flex_1().min_w_0().child(title).child(
                     div()
@@ -1464,7 +1460,7 @@ impl ThreadView {
                         .text_xs()
                         .text_color(muted)
                         .cursor_pointer()
-                        .child(format!("{} · {}", provider.label(), self.model_label()))
+                        .child(self.model_label())
                         .child(Icon::new(IconName::ChevronRight).xsmall())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.model_list = true;
@@ -1493,80 +1489,130 @@ impl ThreadView {
 
         let slider = (!efforts.is_empty()).then(|| {
             let n = efforts.len();
-            let mut track = h_flex()
-                .h(px(28.))
-                .p_0p5()
-                .gap_0p5()
-                .rounded_full()
-                .bg(fg.opacity(0.07));
-            let mut labels = h_flex();
-            for (i, effort) in efforts.iter().enumerate() {
-                let filled = selected.is_some_and(|s| i <= s);
-                let is_sel = selected == Some(i);
-                let fill = if code { pink } else { primary };
-                let pick = Some(effort.clone());
-                let seg = div()
-                    .id(("effort", i))
-                    .flex_1()
-                    .h_full()
-                    .rounded_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .when(filled && !think, |el| el.bg(fill))
-                    .when(!filled, |el| {
-                        el.child(div().size(px(4.)).rounded_full().bg(match effort.as_str() {
+            // The fill runs from the left edge to the middle of the chosen stop.
+            let fill = selected.map(|s| {
+                let fill = div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .bottom_0()
+                    .w(relative((s as f32 + 0.5) / n as f32))
+                    .rounded_full();
+                if think {
+                    fill.with_animation(
+                        "effort-flow",
+                        Animation::new(Duration::from_millis(2600)).repeat(),
+                        |el, t| {
+                            el.bg(linear_gradient(
+                                90.,
+                                linear_color_stop(ultra_hue(t), 0.),
+                                linear_color_stop(ultra_hue((t + 0.45) % 1.), 1.),
+                            ))
+                        },
+                    )
+                    .into_any_element()
+                } else if code {
+                    fill.bg(linear_gradient(
+                        90.,
+                        linear_color_stop(primary, 0.),
+                        linear_color_stop(pink, 1.),
+                    ))
+                    .into_any_element()
+                } else {
+                    fill.bg(primary).into_any_element()
+                }
+            });
+            let cells = h_flex()
+                .absolute()
+                .inset_0()
+                .children(efforts.iter().enumerate().map(|(i, effort)| {
+                    let is_sel = selected == Some(i);
+                    let passed = selected.is_some_and(|s| i < s);
+                    let pick = Some(effort.clone());
+                    let mark: AnyElement = if is_sel {
+                        let thumb = div()
+                            .w(px(30.))
+                            .h(px(22.))
+                            .rounded_full()
+                            .bg(white())
+                            .shadow_sm();
+                        if think {
+                            thumb
+                                .with_animation(
+                                    "thumb-glow",
+                                    Animation::new(Duration::from_millis(2400)).repeat(),
+                                    |el, t| {
+                                        el.shadow(vec![BoxShadow {
+                                            color: ultra_hue(t).opacity(0.55),
+                                            offset: point(px(0.), px(0.)),
+                                            blur_radius: px(
+                                                10. + 8. * (t * std::f32::consts::TAU).sin().abs()
+                                            ),
+                                            spread_radius: px(0.),
+                                            inset: false,
+                                        }])
+                                    },
+                                )
+                                .into_any_element()
+                        } else {
+                            thumb.into_any_element()
+                        }
+                    } else {
+                        let color = match effort.as_str() {
                             ULTRATHINK => ultra_hue(0.),
                             ULTRACODE => pink,
+                            _ if passed => white().opacity(0.75),
                             _ => fg.opacity(0.3),
-                        }))
-                    })
-                    .when(is_sel, |el| {
-                        el.child(
-                            div()
-                                .w(px(20.))
-                                .h(px(18.))
-                                .rounded_full()
-                                .bg(white())
-                                .shadow_sm(),
-                        )
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let settings = TurnSettings {
-                            effort: pick.clone(),
-                            ..this.settings.clone()
                         };
-                        this.set_settings(settings, cx);
-                    }));
-                track = if filled && think {
-                    track.child(seg.with_animation(
-                        ("effort-flow", i),
-                        Animation::new(Duration::from_millis(2400)).repeat(),
-                        move |el, t| el.bg(ultra_hue((t + i as f32 / n as f32 * 0.5) % 1.)),
-                    ))
-                } else {
-                    track.child(seg)
-                };
-                labels = labels.child(
+                        div()
+                            .size(px(4.))
+                            .rounded_full()
+                            .bg(color)
+                            .into_any_element()
+                    };
                     div()
+                        .id(("effort", i))
                         .flex_1()
-                        .text_center()
-                        .text_xs()
-                        .text_color(if is_sel {
-                            fg
-                        } else if effort == ULTRATHINK {
-                            ultra_hue(0.)
-                        } else if effort == ULTRACODE {
-                            pink
-                        } else {
-                            muted
-                        })
-                        .when(is_sel, |el| el.font_weight(FontWeight::SEMIBOLD))
-                        .child(effort_short(effort).to_owned()),
-                );
-            }
-            v_flex().gap_1().child(track).child(labels)
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .child(mark)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let settings = TurnSettings {
+                                effort: pick.clone(),
+                                ..this.settings.clone()
+                            };
+                            this.set_settings(settings, cx);
+                        }))
+                }));
+            let track = div()
+                .relative()
+                .h(px(28.))
+                .rounded_full()
+                .bg(fg.opacity(0.07))
+                .children(fill)
+                .child(cells);
+            let labels = h_flex().children(efforts.iter().enumerate().map(|(i, effort)| {
+                let is_sel = selected == Some(i);
+                div()
+                    .flex_1()
+                    .text_center()
+                    .text_xs()
+                    .text_color(if is_sel {
+                        fg
+                    } else if effort == ULTRATHINK {
+                        ultra_hue(0.)
+                    } else if effort == ULTRACODE {
+                        pink
+                    } else {
+                        muted
+                    })
+                    .when(is_sel, |el| el.font_weight(FontWeight::SEMIBOLD))
+                    .child(effort_short(effort).to_owned())
+            }));
+            v_flex().gap_1p5().child(track).child(labels)
         });
 
         let note = if think {
@@ -1733,7 +1779,7 @@ impl ThreadView {
                     .child(
                         h_flex()
                             .gap_1()
-                            .child(provider_dot(provider, 7.))
+                            .child(provider_icon(provider, 12.))
                             .child(provider.label()),
                     )
                     .selected(rail_pick == Some(provider))
@@ -1822,7 +1868,7 @@ impl ThreadView {
                 .when(selected, |el| el.bg(fg.opacity(0.08)))
                 .hover(move |style| style.bg(fg.opacity(0.06)))
                 .when(locked && provider != current, |el| el.opacity(0.5))
-                .child(provider_dot(provider, 8.))
+                .child(provider_icon(provider, 15.))
                 .child(
                     v_flex()
                         .flex_1()
@@ -2451,18 +2497,10 @@ impl Render for ThreadView {
     }
 }
 
-/// "Good morning" and the like, by the local clock.
+/// The new-chat heading. Not "Good morning": std has no local time zone,
+/// and a greeting that is wrong half the day is worse than none.
 fn greeting() -> &'static str {
-    // ponytail: UTC hour; a local-time crate is not worth it for a greeting.
-    let hour = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() / 3600 % 24)
-        .unwrap_or(12);
-    match hour {
-        5..=11 => "Good morning",
-        12..=17 => "Good afternoon",
-        _ => "Good evening",
-    }
+    "What can I help with?"
 }
 
 fn access_color(access: Access, cx: &App) -> Hsla {
