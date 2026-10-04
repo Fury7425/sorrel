@@ -1,0 +1,9 @@
+[
+{"SessionStarted":{"session_id":"00000000-0000-4000-8000-000000000002","model":"claude-opus-5-5"}},
+{"TextDelta":{"msg_id":"msg_tools_01","text":"Let me check."}},
+{"ToolCall":{"call_id":"toolu_01","kind":"Execute","title":"Bash: ls"}},
+{"ToolUpdate":{"call_id":"toolu_01","status":"Done","preview":"Cargo.toml\nsrc","output":null}},
+{"Plan":{"items":[{"text":"Read files","status":"Done"},{"text":"Write summary","status":"InProgress"}]}},
+{"Usage":{"input":110,"output":20}},
+{"TurnEnded":{"reason":"EndTurn"}}
+]

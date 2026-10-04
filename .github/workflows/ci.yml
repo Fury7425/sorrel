@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Linux system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig-dev libwayland-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libzstd-dev libvulkan1 mesa-vulkan-drivers xvfb
+
+      # Projection, driver replay fixtures for Claude, Codex and ACP, the
+      # watchdog, store paging, checkpoints and instruction files.
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Build perf binary
+        run: cargo build --release --locked -p sorrel --features bench
+
+      # CI runners render in software, so frame numbers here are a regression
+      # tripwire, not the figures in docs/PERF.md.
+      - name: Perf gate
+        shell: bash
+        run: |
+          pip install psutil
+          bin=target/release/sorrel
+          if [ "$RUNNER_OS" = Windows ]; then bin=target/release/sorrel.exe; fi
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a python scripts/perf.py "$bin"
+          else
+            python scripts/perf.py "$bin"
+          fi

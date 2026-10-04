@@ -1,0 +1,6 @@
+[
+{"SessionStarted":{"session_id":"479dc5a8-d0dd-4bfb-b4a2-a9747cffb1e9","model":"claude-opus-5-5"}},
+{"Usage":{"input":0,"output":0}},
+{"Error":{"message":"Not logged in · Please run /login"}},
+{"TurnEnded":{"reason":"Error"}}
+]
