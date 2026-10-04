@@ -227,6 +227,19 @@ pub fn wallpaper(path: &str, mode: Backdrop, scanlines: bool, background: Hsla) 
         )),
         Backdrop::Quiet => div().absolute().inset_0().bg(background.opacity(0.88)),
     };
+    let scrim = (mode == Backdrop::Hero).then(|| {
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(110.))
+            .bg(linear_gradient(
+                180.,
+                linear_color_stop(background.opacity(0.6), 0.),
+                linear_color_stop(background.opacity(0.), 1.),
+            ))
+    });
     div()
         .absolute()
         .inset_0()
@@ -240,6 +253,7 @@ pub fn wallpaper(path: &str, mode: Backdrop, scanlines: bool, background: Hsla) 
                 .object_fit(ObjectFit::Cover),
         )
         .child(veil)
+        .children(scrim)
         .when(scanlines, |el| el.child(scanline_layer()))
 }
 
@@ -301,11 +315,11 @@ fn beam_canvas(t: f32, color: Hsla) -> impl IntoElement {
                 }
             };
             let head = t * perimeter;
-            const TRAIL: usize = 28;
+            const TRAIL: usize = 90;
             for i in 0..TRAIL {
                 let fade = 1. - i as f32 / TRAIL as f32;
-                let (x, y) = at(head - i as f32 * 5.);
-                for (radius, alpha) in [(7., 0.08), (2.5, 0.85)] {
+                let (x, y) = at(head - i as f32 * 1.6);
+                for (radius, alpha) in [(6., 0.03), (1.6, 0.5)] {
                     let r = radius * (0.5 + 0.5 * fade);
                     window.paint_quad(
                         fill(

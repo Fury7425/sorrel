@@ -941,7 +941,7 @@ impl Workspace {
         let nav = h_flex()
             .occlude()
             .gap_0p5()
-            .when(self.sidebar_open, |el| el.w(px(SIDEBAR - 24.)))
+            .when(self.sidebar_open, |el| el.w(px(SIDEBAR - 6.)))
             .flex_shrink_0()
             .child(
                 Button::new("toggle-sidebar")
@@ -1297,13 +1297,23 @@ impl Render for Workspace {
         let toasts = self.render_toasts(cx);
         let prefs = self.prefs().clone();
         let theme = cx.theme();
-        let (background, foreground) = (theme.background, theme.foreground);
+        let (background, foreground, sidebar_bg) =
+            (theme.background, theme.foreground, theme.sidebar);
         let backdrop = match self.view {
             View::Home => Backdrop::Hero,
             View::Thread(_) => Backdrop::Session,
             _ => Backdrop::Quiet,
         };
         let wallpaper = wallpaper_file.is_some();
+        // Over a busy wallpaper the sidebar needs more body to stay legible;
+        // glass alone gets the OS blur behind it.
+        let sidebar_fill = if wallpaper {
+            sidebar_bg.opacity(0.8)
+        } else if prefs.glass {
+            sidebar_bg.opacity(0.58)
+        } else {
+            sidebar_bg
+        };
         div()
             .size_full()
             .relative()
@@ -1320,6 +1330,19 @@ impl Render for Workspace {
                     prefs.effect == proto::Effect::Scanlines,
                     background,
                 ))
+            })
+            .when(self.sidebar_open, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .bottom_0()
+                        .w(px(SIDEBAR))
+                        .bg(sidebar_fill)
+                        .border_r_1()
+                        .border_color(foreground.opacity(0.07)),
+                )
             })
             .child(
                 v_flex().relative().size_full().child(titlebar).child(

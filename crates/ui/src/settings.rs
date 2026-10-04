@@ -125,7 +125,6 @@ impl Workspace {
     pub(crate) fn render_settings_nav(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (fg, muted, sidebar) = (theme.foreground, theme.muted_foreground, theme.sidebar);
-        let see_through = self.prefs().glass || !self.prefs().wallpaper.is_empty();
         let current = match self.view {
             View::Settings(section) => Some(section),
             _ => None,
@@ -171,13 +170,6 @@ impl Workspace {
             .w(px(SIDEBAR))
             .h_full()
             .flex_shrink_0()
-            .bg(if see_through {
-                sidebar.opacity(0.58)
-            } else {
-                sidebar
-            })
-            .border_r_1()
-            .border_color(fg.opacity(0.07))
             .child(
                 div().px_2p5().pt_1().pb_2p5().child(
                     h_flex()

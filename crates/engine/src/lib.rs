@@ -650,10 +650,24 @@ impl Engine {
     /// Answers with the provider's models; Codex asks its app-server.
     fn list_models(&mut self, provider: Provider) {
         match provider {
-            Provider::Claude => self.send(Update::Models {
-                provider,
-                models: claude::models(),
-            }),
+            Provider::Claude => {
+                // The known list now, the CLI's full list once it answers.
+                self.send(Update::Models {
+                    provider,
+                    models: claude::models(),
+                });
+                let (bin, key) = (
+                    self.settings.bin(provider),
+                    self.settings.key_for(provider),
+                );
+                let (_, env) = self.settings.extra(provider);
+                let updates = self.updates.clone();
+                tokio::spawn(async move {
+                    if let Ok(models) = claude::discover_models(bin, key, env).await {
+                        let _ = updates.send(Update::Models { provider, models });
+                    }
+                });
+            }
             Provider::Codex => {
                 let server = self.codex_server();
                 let updates = self.updates.clone();

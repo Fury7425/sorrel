@@ -37,7 +37,14 @@ pub fn check(updates: mpsc::Sender<Update>) {
             .as_str()
             .unwrap_or_default()
             .trim_start_matches('v');
-        let url = release["html_url"].as_str().unwrap_or_default();
+        // The Windows setup exe downloads directly; other platforms get the release page.
+        let setup = release["assets"].as_array().and_then(|assets| {
+            assets.iter().find_map(|a| {
+                let url = a["browser_download_url"].as_str()?;
+                (cfg!(windows) && url.ends_with("-windows-x64-setup.exe")).then_some(url)
+            })
+        });
+        let url = setup.or(release["html_url"].as_str()).unwrap_or_default();
         if !url.is_empty() && newer(tag, env!("CARGO_PKG_VERSION")) {
             let _ = updates.blocking_send(Update::UpdateAvailable {
                 version: tag.to_owned(),

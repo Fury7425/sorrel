@@ -40,8 +40,7 @@ use crate::{DriverCommand, SessionConfig, StderrTail, blob, clip, fail};
 /// Tools Ask mode refuses without asking.
 const WRITE_TOOLS: [&str; 4] = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
 
-/// The models the picker offers. The CLI has no list command, so these are
-/// its documented aliases plus a pinned small model.
+/// The picker's fallback when the CLI can't be asked: its current models.
 pub fn models() -> Vec<ModelInfo> {
     let efforts: Vec<String> = [
         "low", "medium", "high", "xhigh", "max", ULTRATHINK, ULTRACODE,
@@ -49,23 +48,121 @@ pub fn models() -> Vec<ModelInfo> {
     .map(String::from)
     .to_vec();
     [
-        ("fable", "Fable", "Most capable"),
-        ("opus", "Opus", "Deep reasoning for hard work"),
-        ("sonnet", "Sonnet", "Fast and capable"),
-        (
-            "claude-haiku-4-5-20251001",
-            "Haiku 4.5",
-            "Quickest, for small tasks",
-        ),
+        ("claude-fable-5-1", "Fable 5.1", "Most capable for your hardest tasks"),
+        ("claude-opus-5-5", "Opus 5.5", "Best for everyday, complex tasks"),
+        ("claude-sonnet-5-5", "Sonnet 5.5", "Efficient for routine tasks"),
+        ("claude-haiku-4-5-20251001", "Haiku 4.5", "Fastest for quick answers"),
     ]
     .into_iter()
     .map(|(id, label, description)| ModelInfo {
         id: id.into(),
         label: label.into(),
         description: description.into(),
-        efforts: efforts.clone(),
+        efforts: if id.contains("haiku") {
+            Vec::new()
+        } else {
+            efforts.clone()
+        },
     })
     .collect()
+}
+
+/// Every model the CLI's own `/model` picker offers, older ones included,
+/// read from its `initialize` handshake. Works signed out too.
+pub async fn discover_models(
+    bin: PathBuf,
+    api_key: Option<String>,
+    env: Vec<(String, String)>,
+) -> Result<Vec<ModelInfo>, String> {
+    let mut cmd = crate::command(&bin);
+    cmd.args([
+        "--print",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+    ])
+    .stderr(Stdio::null())
+    .envs(env)
+    .current_dir(std::env::temp_dir());
+    if let Some(key) = &api_key {
+        cmd.env("ANTHROPIC_API_KEY", key);
+    }
+    // Dropped (and so killed) on return.
+    let mut child = cmd.spawn().map_err(|e| crate::spawn_error(&bin, &e))?;
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout is piped")).lines();
+    let request = json!({
+        "type": "control_request",
+        "request_id": "models",
+        "request": { "subtype": "initialize" },
+    });
+    stdin
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    let read = async {
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if v["type"] == "control_response" && v["response"]["request_id"] == "models" {
+                return parse_models(&v["response"]);
+            }
+        }
+        Err("claude closed before it listed its models".to_owned())
+    };
+    tokio::time::timeout(Duration::from_secs(30), read)
+        .await
+        .map_err(|_| "claude took too long to list its models".to_owned())?
+}
+
+/// The models in an `initialize` response, aliases resolved to concrete ids.
+fn parse_models(response: &Value) -> Result<Vec<ModelInfo>, String> {
+    if response["subtype"] == "error" {
+        return Err(string(&response["error"]));
+    }
+    let mut models: Vec<ModelInfo> = Vec::new();
+    for entry in response["response"]["models"].as_array().into_iter().flatten() {
+        let value = entry["value"].as_str().unwrap_or_default();
+        // The picker's own "Default" row stands for this one.
+        if value == "default" {
+            continue;
+        }
+        let id = entry["resolvedModel"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .unwrap_or(value);
+        if id.is_empty() || models.iter().any(|m| m.id == id) {
+            continue;
+        }
+        let mut efforts: Vec<String> = entry["supportedEffortLevels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.as_str().map(str::to_owned))
+            .collect();
+        // Ultrathink is a prompt prefix any thinking model takes; Ultracode
+        // runs at xhigh, so only where xhigh exists.
+        let xhigh = efforts.iter().any(|e| e == "xhigh");
+        if !efforts.is_empty() {
+            efforts.push(ULTRATHINK.into());
+        }
+        if xhigh {
+            efforts.push(ULTRACODE.into());
+        }
+        models.push(ModelInfo {
+            id: id.into(),
+            label: entry["displayName"].as_str().unwrap_or(id).into(),
+            description: string(&entry["description"]),
+            efforts,
+        });
+    }
+    if models.is_empty() {
+        return Err("claude listed no models".into());
+    }
+    Ok(models)
 }
 
 /// Asks `claude auth status`: state, detail (the plan when signed in), and
@@ -917,6 +1014,30 @@ async fn next_line(process: &mut Option<Process>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initialize_models_resolve_aliases_and_keep_older_ones() {
+        let response = json!({ "subtype": "success", "response": { "models": [
+            { "value": "default", "resolvedModel": "claude-opus-5-5", "displayName": "Default (recommended)" },
+            { "value": "opus", "resolvedModel": "claude-opus-5-5", "displayName": "Opus 5.5",
+              "description": "Best for everyday, complex tasks",
+              "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"] },
+            { "value": "haiku", "resolvedModel": "claude-haiku-4-5-20251001", "displayName": "Haiku 4.5" },
+            { "value": "claude-opus-4-6", "resolvedModel": "claude-opus-4-6", "displayName": "Opus 4.6",
+              "supportedEffortLevels": ["low", "medium", "high", "max"] },
+        ]}});
+        let models = parse_models(&response).unwrap();
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["claude-opus-5-5", "claude-haiku-4-5-20251001", "claude-opus-4-6"]
+        );
+        assert_eq!(models[0].label, "Opus 5.5");
+        assert_eq!(models[0].efforts.last().map(String::as_str), Some(ULTRACODE));
+        assert!(models[1].efforts.is_empty());
+        assert_eq!(models[2].efforts.last().map(String::as_str), Some(ULTRATHINK));
+        assert!(parse_models(&json!({ "subtype": "error", "error": "offline" })).is_err());
+    }
 
     #[test]
     fn chat_never_asks_for_bypass() {

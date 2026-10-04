@@ -11,14 +11,22 @@ version="${1:?usage: package.sh VERSION}"
 mkdir -p dist
 case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*)
-    exe=target/release/sorrel.exe
-    if [ -n "${WINDOWS_CERT_PFX:-}" ]; then
+    # One-click installer (scripts/sorrel.iss). Needs Inno Setup 6:
+    # `winget install JRSoftware.InnoSetup` locally, choco in CI.
+    setup="dist/sorrel-$version-windows-x64-setup.exe"
+    sign() {
+      [ -n "${WINDOWS_CERT_PFX:-}" ] || return 0
       echo "$WINDOWS_CERT_PFX" | base64 -d > cert.pfx
       signtool=$(ls "/c/Program Files (x86)/Windows Kits/10/bin/"*/x64/signtool.exe | tail -1)
-      "$signtool" sign /f cert.pfx /p "$WINDOWS_CERT_PASSWORD" /fd sha256 /tr http://timestamp.digicert.com /td sha256 "$exe"
+      MSYS2_ARG_CONV_EXCL='*' "$signtool" sign /f cert.pfx /p "$WINDOWS_CERT_PASSWORD" /fd sha256 /tr http://timestamp.digicert.com /td sha256 "$1"
       rm cert.pfx
-    fi
-    powershell -NoProfile -Command "Compress-Archive -Force -Path '$exe' -DestinationPath 'dist/sorrel-$version-windows-x64.zip'"
+    }
+    sign target/release/sorrel.exe
+    for iscc in "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" "${LOCALAPPDATA:-}/Programs/Inno Setup 6/ISCC.exe"; do
+      [ -f "$iscc" ] && break
+    done
+    "$iscc" -Q "-DVersion=$version" scripts/sorrel.iss
+    sign "$setup"
     ;;
   Darwin)
     app=dist/Sorrel.app

@@ -28,7 +28,6 @@ impl Workspace {
             theme.sidebar,
             theme.primary,
         );
-        let see_through = self.prefs().glass || !self.prefs().wallpaper.is_empty();
         let chat = self.chat;
         let query = self.editors.search.read(cx).value().trim().to_lowercase();
 
@@ -267,13 +266,6 @@ impl Workspace {
             .w(px(SIDEBAR))
             .h_full()
             .flex_shrink_0()
-            .bg(if see_through {
-                sidebar.opacity(0.58)
-            } else {
-                sidebar
-            })
-            .border_r_1()
-            .border_color(fg.opacity(0.07))
             .child(
                 v_flex()
                     .gap_2()

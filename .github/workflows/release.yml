@@ -36,6 +36,10 @@ jobs:
           sudo apt-get install -y libfontconfig-dev libwayland-dev libxkbcommon-x11-dev \
             libx11-xcb-dev libzstd-dev libvulkan1
 
+      - name: Inno Setup
+        if: runner.os == 'Windows'
+        run: choco install innosetup -y --no-progress
+
       - name: Build
         run: cargo build --release --locked -p sorrel
 

@@ -689,9 +689,11 @@ impl ThreadView {
                 .into_any_element(),
             Item::Assistant { .. } => {
                 let body = match &self.live {
-                    Some((live_ix, state)) if *live_ix == ix => {
-                        TextView::new(state).into_any_element()
-                    }
+                    // CLI deltas arrive in bursts; fading each in word by
+                    // word reads as a steady stream instead of jumps.
+                    Some((live_ix, state)) if *live_ix == ix => TextView::new(state)
+                        .stream_fade(true)
+                        .into_any_element(),
                     _ => TextView::markdown(("md", ix), text).into_any_element(),
                 };
                 if chat {
@@ -1399,9 +1401,9 @@ impl ThreadView {
                 cx.notify();
             }))
             .trigger(trigger)
-            .w(px(if self.model_list { 460. } else { 320. }))
+            .w(px(320.))
             .p_3()
-            .bg(popover.opacity(0.94))
+            .bg(popover.opacity(0.98))
             .border_color(fg.opacity(0.1))
             .child(content)
             .into_any_element()
@@ -1426,6 +1428,11 @@ impl ThreadView {
         let think = current.as_deref() == Some(ULTRATHINK);
         let code = current.as_deref() == Some(ULTRACODE);
         let pink: Hsla = rgb(0xec6fae).into();
+        let rail_fill = if primary.l > 0.8 {
+            fg.opacity(0.3)
+        } else {
+            primary
+        };
 
         let title = div().text_base().font_weight(FontWeight::SEMIBOLD).child(
             current
@@ -1448,44 +1455,31 @@ impl ThreadView {
         };
 
         let header = h_flex()
-            .gap_2p5()
-            .child(provider_icon(provider, 20.))
+            .gap_2()
+            .child(provider_tile(provider, 34.))
             .child(
-                v_flex().flex_1().min_w_0().child(title).child(
-                    div()
-                        .id("to-model-list")
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .text_xs()
-                        .text_color(muted)
-                        .cursor_pointer()
-                        .child(self.model_label())
-                        .child(Icon::new(IconName::ChevronRight).xsmall())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.model_list = true;
-                            cx.notify();
-                        })),
-                ),
-            )
-            .when(claude, |el| {
-                let fast = self.settings.fast;
-                el.child(
-                    Button::new("fast-bolt")
-                        .ghost()
-                        .small()
-                        .icon(Icon::new(Lucide::Zap).text_color(if fast { warning } else { muted }))
-                        .selected(fast)
-                        .tooltip("Fast mode")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let settings = TurnSettings {
-                                fast: !this.settings.fast,
-                                ..this.settings.clone()
-                            };
-                            this.set_settings(settings, cx);
-                        })),
-                )
-            });
+                h_flex()
+                    .id("to-model-list")
+                    .flex_1()
+                    .min_w_0()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(fg.opacity(0.06)))
+                    .child(
+                        v_flex().flex_1().min_w_0().child(title).child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .truncate()
+                                .child(self.model_label()),
+                        ),
+                    )
+                    .child(Icon::new(IconName::ChevronRight).small().text_color(muted))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_model_list(window, cx))),
+            );
 
         let slider = (!efforts.is_empty()).then(|| {
             let n = efforts.len();
@@ -1519,7 +1513,7 @@ impl ThreadView {
                     ))
                     .into_any_element()
                 } else {
-                    fill.bg(primary).into_any_element()
+                    fill.bg(rail_fill).into_any_element()
                 }
             });
             let cells = h_flex()
@@ -1580,16 +1574,44 @@ impl ThreadView {
                         .cursor_pointer()
                         .child(mark)
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            // The chosen stop again hands effort back to the CLI.
+                            let effort = if this.settings.effort == pick {
+                                None
+                            } else {
+                                pick.clone()
+                            };
                             let settings = TurnSettings {
-                                effort: pick.clone(),
+                                effort,
                                 ..this.settings.clone()
                             };
                             this.set_settings(settings, cx);
                         }))
                 }));
+            let stops = efforts.clone();
             let track = div()
+                .id("effort-track")
                 .relative()
                 .h(px(28.))
+                // Dragging along the track picks whichever stop is under the pointer.
+                .on_drag(EffortDrag, |drag, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| drag.clone())
+                })
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<EffortDrag>, _, cx| {
+                        let bounds = event.bounds;
+                        let x = (event.event.position.x - bounds.left()) / bounds.size.width;
+                        let i = ((x * n as f32).floor().max(0.) as usize).min(n - 1);
+                        let pick = Some(stops[i].clone());
+                        if this.settings.effort != pick {
+                            let settings = TurnSettings {
+                                effort: pick,
+                                ..this.settings.clone()
+                            };
+                            this.set_settings(settings, cx);
+                        }
+                    },
+                ))
                 .rounded_full()
                 .bg(fg.opacity(0.07))
                 .children(fill)
@@ -1744,55 +1766,80 @@ impl ThreadView {
             .into_any_element()
     }
 
-    /// Search, provider tabs and the models of the chosen tab.
+    /// Switches the model popover to its list, ready to type into.
+    fn open_model_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.model_list = true;
+        let search = self.model_search.read(cx).focus_handle(cx);
+        window.focus(&search, cx);
+        cx.notify();
+    }
+
+    /// Search, provider tabs and the chosen tab's models, one line each.
     fn render_model_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let (muted, fg) = (theme.muted_foreground, theme.foreground);
+        let (muted, fg, primary) = (theme.muted_foreground, theme.foreground, theme.primary);
         let current = self.provider();
         // A thread keeps its CLI once it has messages.
         let locked = !self.transcript.items.is_empty();
         let query = self.model_search.read(cx).value().trim().to_lowercase();
-        let rail_pick = self.rail;
+        // Nothing starred yet: the starred tab would be empty, show the CLI's models.
+        let rail_pick = match self.rail {
+            None if self.favorites.is_empty() => Some(current),
+            rail => rail,
+        };
         let enabled: Vec<Provider> = if self.look.enabled.is_empty() {
             Provider::ALL.to_vec()
         } else {
             self.look.enabled.clone()
         };
 
-        let mut tabs = h_flex().gap_0p5().flex_wrap().child(
-            Button::new("rail-favorites")
-                .ghost()
-                .xsmall()
-                .icon(IconName::Star)
-                .selected(rail_pick.is_none())
-                .tooltip("Favorites")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.rail = None;
-                    cx.notify();
-                })),
-        );
-        for provider in enabled.iter().copied() {
-            tabs = tabs.child(
-                Button::new(("rail", provider as usize))
+        // Tabs only when there is something to switch between: icons, with
+        // the chosen one spelled out.
+        let tabs = (enabled.len() > 1 || !self.favorites.is_empty()).then(|| {
+            let tab = |id: ElementId, on: bool| {
+                Button::new(id)
                     .ghost()
                     .xsmall()
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(provider_icon(provider, 12.))
-                            .child(provider.label()),
-                    )
-                    .selected(rail_pick == Some(provider))
-                    .disabled(locked && provider != current)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.rail = Some(provider);
-                        if !this.catalog.contains_key(&provider) {
-                            this.request(Request::ListModels { provider });
-                        }
+                    .selected(on)
+                    .when(on, |b| b.bg(fg.opacity(0.1)))
+            };
+            let starred = rail_pick.is_none();
+            let mut tabs = h_flex().gap_0p5().child(
+                tab("rail-favorites".into(), starred)
+                    .icon(if starred {
+                        IconName::StarFill
+                    } else {
+                        IconName::Star
+                    })
+                    .tooltip("Starred")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.rail = None;
                         cx.notify();
                     })),
             );
-        }
+            for provider in enabled.iter().copied() {
+                let on = rail_pick == Some(provider);
+                tabs = tabs.child(
+                    tab(("rail", provider as usize).into(), on)
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .child(provider_icon(provider, 13.))
+                                .when(on, |el| el.child(provider.label())),
+                        )
+                        .tooltip(provider.label())
+                        .disabled(locked && provider != current)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.rail = Some(provider);
+                            if !this.catalog.contains_key(&provider) {
+                                this.request(Request::ListModels { provider });
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+            tabs
+        });
 
         // (provider, model id or None for the CLI default, label, description)
         let mut entries: Vec<(Provider, Option<String>, String, String)> = Vec::new();
@@ -1811,7 +1858,7 @@ impl ThreadView {
                 provider,
                 None,
                 "Default".to_owned(),
-                "The CLI's own default".to_owned(),
+                "Whatever the CLI picks".to_owned(),
             )];
             list.extend(
                 models
@@ -1840,13 +1887,13 @@ impl ThreadView {
         let selected_model = self.settings.model.clone();
         let mut list = v_flex()
             .id("model-list")
-            .max_h(px(300.))
+            .max_h(px(320.))
             .overflow_y_scroll()
             .gap_0p5();
         if entries.is_empty() {
             list = list.child(div().p_2().text_xs().text_color(muted).child(
                 if rail_pick.is_none() && query.is_empty() {
-                    "Star models to keep them here."
+                    "Star a model to keep it here."
                 } else {
                     "No models match."
                 },
@@ -1860,23 +1907,33 @@ impl ThreadView {
             let pick_id = id.clone();
             let mut row = h_flex()
                 .id(("model-row", ix))
-                .gap_2p5()
+                .group("model-row")
+                .flex_shrink_0()
+                .h(px(32.))
+                .gap_2()
                 .px_2()
-                .py_1p5()
-                .rounded_lg()
+                .rounded_md()
                 .cursor_pointer()
                 .when(selected, |el| el.bg(fg.opacity(0.08)))
                 .hover(move |style| style.bg(fg.opacity(0.06)))
-                .when(locked && provider != current, |el| el.opacity(0.5))
-                .child(provider_icon(provider, 15.))
+                .when(locked && provider != current, |el| el.opacity(0.45))
+                .child(provider_icon(provider, 14.))
                 .child(
-                    v_flex()
+                    div()
+                        .flex_shrink_0()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(label),
+                )
+                .child(
+                    div()
                         .flex_1()
                         .min_w_0()
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label))
-                        .child(div().text_xs().text_color(muted).child(description)),
+                        .truncate()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(description),
                 )
-                .when(selected, |el| el.child(Icon::new(IconName::Check).small()))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if provider != this.provider() {
                         if !this.transcript.items.is_empty() {
@@ -1894,25 +1951,40 @@ impl ThreadView {
                     this.set_settings(settings, cx);
                 }));
             if let Some(model) = id {
+                // The star shows on hover, and stays once starred.
                 row = row.child(
-                    Button::new(("star", ix))
-                        .ghost()
-                        .xsmall()
-                        .icon(if favorite {
-                            IconName::StarFill
-                        } else {
-                            IconName::Star
+                    div()
+                        .when(!favorite, |el| {
+                            el.opacity(0.)
+                                .group_hover("model-row", |style| style.opacity(1.))
                         })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            // The star sits on the row; don't also pick the model.
-                            cx.stop_propagation();
-                            this.request(Request::ToggleFavorite {
-                                provider,
-                                model: model.clone(),
-                            })
-                        })),
+                        .child(
+                            Button::new(("star", ix))
+                                .ghost()
+                                .xsmall()
+                                .icon(
+                                    Icon::new(if favorite {
+                                        IconName::StarFill
+                                    } else {
+                                        IconName::Star
+                                    })
+                                    .text_color(if favorite { primary } else { muted }),
+                                )
+                                .tooltip(if favorite { "Unstar" } else { "Star" })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    // The star sits on the row; don't also pick the model.
+                                    cx.stop_propagation();
+                                    this.request(Request::ToggleFavorite {
+                                        provider,
+                                        model: model.clone(),
+                                    })
+                                })),
+                        ),
                 );
             }
+            row = row.when(selected, |el| {
+                el.child(Icon::new(IconName::Check).small().text_color(primary))
+            });
             list = list.child(row);
         }
 
@@ -1920,20 +1992,31 @@ impl ThreadView {
             .gap_2()
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap_1()
+                    .pb_2()
+                    .border_b_1()
+                    .border_color(fg.opacity(0.08))
                     .child(
                         Button::new("back-to-options")
                             .ghost()
                             .xsmall()
                             .icon(IconName::ChevronLeft)
+                            .tooltip("Back")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.model_list = false;
                                 cx.notify();
                             })),
                     )
-                    .child(div().flex_1().child(Input::new(&self.model_search).small())),
+                    .child(
+                        div().flex_1().child(
+                            Input::new(&self.model_search)
+                                .small()
+                                .appearance(false)
+                                .prefix(Icon::new(IconName::Search).small().text_color(muted)),
+                        ),
+                    ),
             )
-            .child(tabs)
+            .children(tabs)
             .child(list)
             .into_any_element()
     }
@@ -2007,7 +2090,7 @@ impl ThreadView {
             )
             .w(px(300.))
             .p_1()
-            .bg(theme.popover.opacity(0.94))
+            .bg(theme.popover.opacity(0.98))
             .child(list)
             .into_any_element()
     }
@@ -2057,12 +2140,14 @@ impl ThreadView {
                 Button::new("project-trigger")
                     .ghost()
                     .xsmall()
+                    .rounded_full()
+                    .bg(theme.background.opacity(0.6))
                     .icon(Lucide::Folder)
                     .label(name),
             )
             .w(px(240.))
             .p_1()
-            .bg(theme.popover.opacity(0.94))
+            .bg(theme.popover.opacity(0.98))
             .child(list)
             .into_any_element()
     }
@@ -2160,6 +2245,7 @@ impl ThreadView {
                 .child(model)
                 .child(
                     Button::new("stop")
+                        .primary()
                         .small()
                         .rounded_full()
                         .icon(IconName::Square)
@@ -2510,6 +2596,16 @@ fn access_color(access: Access, cx: &App) -> Hsla {
         Access::AutoEdits => theme.info,
         Access::Auto => theme.primary,
         Access::FullAccess => theme.danger,
+    }
+}
+
+/// Drag payload for the effort slider; the drag itself draws nothing.
+#[derive(Clone)]
+struct EffortDrag;
+
+impl Render for EffortDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
     }
 }
 

@@ -21,3 +21,5 @@ Building on Windows needs the MSVC toolchain and the Windows 10/11 SDK; Linux ne
 ## Release
 
 Push a tag such as `v0.1.0`. GitHub Actions builds Windows, macOS and Linux packages and publishes a release, signing them when the secrets listed in `scripts/package.sh` are set.
+
+On Windows the release is `sorrel-<version>-windows-x64-setup.exe`: double-click it and it installs to `%LOCALAPPDATA%\Programs\Sorrel` without an admin prompt or wizard, adds Start menu and desktop shortcuts, and opens Sorrel. Uninstall from Settings > Apps. Build it locally with `bash scripts/package.sh 0.1.0` after `cargo build --release -p sorrel` (needs `winget install JRSoftware.InnoSetup`).
