@@ -28,7 +28,18 @@ pub fn run(
     set_trace_enabled(true);
     let mut collector = FrameTimingCollector::new();
     cx.spawn(async move |cx| {
-        // Stream: the replay started with the process; wait for its turn to end.
+        // Startup (opening the window and loading the seeded page) is not
+        // streaming; wait for the thread to show, then start counting.
+        loop {
+            if view.read_with(cx, |workspace, _| workspace.thread_view().is_some()) {
+                break;
+            }
+            cx.background_executor().timer(Duration::from_millis(10)).await;
+        }
+        cx.background_executor().timer(Duration::from_millis(200)).await;
+        collector.collect_unseen();
+
+        // Stream: wait for the replayed turn to end.
         let thread = loop {
             let done = view.read_with(cx, |workspace, cx| {
                 workspace

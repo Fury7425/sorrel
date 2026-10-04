@@ -69,7 +69,7 @@ impl ThreadView {
                 .submit_on_enter(true)
                 .placeholder("Message (Enter sends, Shift+Enter for a new line)")
         });
-        composer.update(cx, |composer, cx| composer.focus(window, cx));
+        // Not focused on open: a focused composer blinks its caret, which redraws an idle window.
         let _subscription = cx.subscribe_in(&composer, window, |this, _, event, window, cx| {
             if let InputEvent::PressEnter { shift: false, .. } = event {
                 this.send(window, cx);
