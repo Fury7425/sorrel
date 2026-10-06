@@ -40,14 +40,6 @@ jobs:
       - name: Build perf binary
         run: cargo build --release --locked -p sorrel --features bench
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sorrel-${{ matrix.os }}
-          path: |
-            target/release/sorrel
-            target/release/sorrel.exe
-          if-no-files-found: ignore
-
       # CI runners render in software, so frame numbers here are a regression
       # tripwire, not the figures in docs/PERF.md.
       - name: Perf gate
@@ -61,3 +53,20 @@ jobs:
           else
             python scripts/perf.py "$bin"
           fi
+
+      # Installers, not raw binaries: .exe setup, .app zip, tar.gz. Built
+      # after the perf gate so the shipped binary has no bench feature.
+      - name: Inno Setup
+        if: runner.os == 'Windows'
+        run: choco install innosetup -y --no-progress
+
+      - name: Package installer
+        shell: bash
+        run: |
+          cargo build --release --locked -p sorrel
+          scripts/package.sh "0.0.0-${GITHUB_SHA::7}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sorrel-${{ matrix.os }}
+          path: dist/*
